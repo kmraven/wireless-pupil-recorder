@@ -129,6 +129,8 @@ int frame_interval = 0;          // record at full speed
 int speed_up_factor = 1;          // play at realtime
 int stream_delay = 500;           // minimum of 500 ms delay between frames
 int MagicNumber = 12;                // change this number to reset the eprom in your esp32 for file numbers
+int max_recordings = 0;           // 0 records continuously until stopped
+uint32_t completed_recordings = 0;
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -136,6 +138,9 @@ bool configfile = false;
 bool InternetOff = true;
 bool reboot_now = false;
 bool restart_now = false;
+volatile bool safe_stop_requested = false;
+volatile bool recording_closed_for_shutdown = false;
+volatile bool safe_stop_complete = false;
 String cssid;
 String cpass;
 String czone;
@@ -597,6 +602,7 @@ void read_config_file() {
     GMT // timezone
     ssid1234  // ssid wifi name
     mrpeanut  // ssid password
+    0  // recording count; 0 = unlimited
     ~~~
 
     Lines above are rigid - do not delete lines, must have 2 spaces after the number or string
@@ -618,6 +624,7 @@ void read_config_file() {
   String czone = "GMT";
   cssid = "ap";
   cpass = "mrpeanut";
+  int crecordingcount = 0;
 
   File config_file =SD.open("/config.txt", "r");
   if (config_file) {
@@ -642,6 +649,19 @@ void read_config_file() {
     junk = config_file.readStringUntil('\n');
     cpass = config_file.readStringUntil(' ');
     junk = config_file.readStringUntil('\n');
+
+    // The tenth line is optional so existing nine-line config files remain valid.
+    // Read only that line; do not let parseInt() scan the explanatory text below it.
+    if (config_file.available()) {
+      String recording_count_line = config_file.readStringUntil('\n');
+      recording_count_line.trim();
+      if (recording_count_line.length() > 0) {
+        char first_character = recording_count_line.charAt(0);
+        if ((first_character >= '0' && first_character <= '9') || first_character == '-') {
+          crecordingcount = recording_count_line.toInt();
+        }
+      }
+    }
     config_file.close();
 
     if (String(cssid) == "ssid1234" || String(cssid) == "Ssid1234") {
@@ -658,10 +678,12 @@ void read_config_file() {
 
     // lets make a simple.txt config file
     File new_simple =SD.open("/config.txt", "w");
-    new_simple.print(config_txt);
+    new_simple.write((const uint8_t *)config_txt, config_txt_len);
     new_simple.close();
     cinternet = 5;
   }
+
+  if (crecordingcount < 0) crecordingcount = 0;
 
   Serial.printf("=========   Data fram config.txt and defaults  =========\n");
   Serial.printf("Name %s\n", cname); logfile.printf("Name %s\n", cname);
@@ -673,6 +695,7 @@ void read_config_file() {
   Serial.printf("Length %d\n", clength); logfile.printf("Length %d\n", clength);
   Serial.printf("Interval %d\n", cinterval); logfile.printf("Interval %d\n", cinterval);
   Serial.printf("Speedup %d\n", cspeedup); logfile.printf("Speedup %d\n", cspeedup);
+  Serial.printf("Recording count %d (0 = unlimited)\n", crecordingcount); logfile.printf("Recording count %d (0 = unlimited)\n", crecordingcount);
   Serial.printf("Streamdelay %d\n", cstreamdelay); logfile.printf("Streamdelay %d\n", cstreamdelay);
   Serial.printf("Internet %d\n", cinternet); logfile.printf("Internet %d\n", cinternet);
   Serial.printf("Zone len %d, %s\n", czone.length(), czone.c_str()); //logfile.printf("Zone len %d, %s\n", czone.length(), czone);
@@ -688,6 +711,7 @@ void read_config_file() {
   frame_interval = cinterval;
   speed_up_factor = cspeedup;
   stream_delay = cstreamdelay;
+  max_recordings = crecordingcount;
   IncludeInternet = cinternet;
   configfile = true;
   TIMEZONE = czone;
@@ -2373,9 +2397,78 @@ int delete_old_stuff_flag = 0;
 const int lightSensorPin = 4; // 6 照度センサーを接続したGPIOピンをD8/A8 (GPIO7)に変更 // 照度センサーを接続したGPIOピン追加
 const int GPIOGNDPin = 5;
 const int GPIOVPin = 6;
+const int SAFE_STOP_BUTTON_PIN = 0;       // XIAO ESP32S3 Sense BOOT button
+const uint32_t SAFE_STOP_HOLD_MS = 1500;
+
+bool safe_stop_button_pressed = false;
+bool safe_stop_button_latched = false;
+uint32_t safe_stop_button_pressed_at = 0;
+bool safe_stop_led_on = false;
+uint32_t safe_stop_led_changed_at = 0;
 
 long wakeup;
 long last_wakeup = 0;
+
+void poll_safe_stop_button() {
+  bool pressed = digitalRead(SAFE_STOP_BUTTON_PIN) == LOW;
+
+  if (!pressed) {
+    safe_stop_button_pressed = false;
+    return;
+  }
+
+  if (!safe_stop_button_pressed) {
+    safe_stop_button_pressed = true;
+    safe_stop_button_pressed_at = millis();
+    return;
+  }
+
+  if (!safe_stop_button_latched &&
+      (uint32_t)(millis() - safe_stop_button_pressed_at) >= SAFE_STOP_HOLD_MS) {
+    safe_stop_button_latched = true;
+    safe_stop_requested = true;
+    Serial.println("BOOT held for 1.5 seconds: finishing the current AVI and safely unmounting the SD card.");
+  }
+}
+
+void close_file_for_safe_shutdown(File &file) {
+  if (file) {
+    file.flush();
+    file.close();
+  }
+}
+
+void perform_safe_sd_shutdown() {
+  Serial.println("Finalizing files and unmounting the SD card ...");
+  if (logfile) {
+    logfile.println("Safe stop: finalizing files and unmounting the SD card.");
+    logfile.flush();
+  }
+
+  // The camera task has already finished end_avi() before setting
+  // recording_closed_for_shutdown. These first two closes are defensive.
+  close_file_for_safe_shutdown(avifile);
+  close_file_for_safe_shutdown(idxfile);
+  close_file_for_safe_shutdown(timestampFile);
+  close_file_for_safe_shutdown(illuminanceFile);
+  close_file_for_safe_shutdown(logfile);
+  SD.end();
+
+  digitalWrite(GPIOGNDPin, LOW);
+  digitalWrite(GPIOVPin, HIGH);
+  safe_stop_led_on = true;
+  safe_stop_led_changed_at = millis();
+  safe_stop_complete = true;
+  Serial.println("SD card unmounted. Slow LED blink means it is safe to remove power.");
+}
+
+void park_camera_for_safe_shutdown() {
+  recording_closed_for_shutdown = true;
+  while (!safe_stop_complete) {
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  vTaskDelete(NULL);
+}
 
 void setup() {
 
@@ -2395,6 +2488,7 @@ void setup() {
   digitalWrite(GPIOGNDPin, LOW); // 初期状態は消灯 (LOWで消灯と仮定)
   pinMode(GPIOVPin, OUTPUT);
   digitalWrite(GPIOVPin, LOW); // 初期状態は消灯 (LOWで消灯と仮定)
+  pinMode(SAFE_STOP_BUTTON_PIN, INPUT_PULLUP);
 
   pinMode(43, INPUT_PULLUP); // pull this down to stop recording をGPIO43に変更
   pinMode(44, INPUT_PULLUP);        // pull this down switch wifi をGPIO44に変更
@@ -2613,6 +2707,28 @@ void the_sd_loop (void* pvParameter) {
 
 
 void loop() {
+  poll_safe_stop_button();
+
+  if (safe_stop_requested) {
+    // Latch recording off and stop the only web service that accesses the SD card.
+    start_record = 0;
+    filemgr.end();
+
+    if (recording_closed_for_shutdown && !safe_stop_complete) {
+      perform_safe_sd_shutdown();
+    }
+
+    if (safe_stop_complete &&
+        (uint32_t)(millis() - safe_stop_led_changed_at) >= 500) {
+      safe_stop_led_changed_at = millis();
+      safe_stop_led_on = !safe_stop_led_on;
+      digitalWrite(GPIOVPin, safe_stop_led_on ? HIGH : LOW);
+    }
+
+    delay(50);
+    return;
+  }
+
   long run_time = millis() - boot_time;
 
   if (delete_old_stuff_flag == 1) {
@@ -2723,6 +2839,11 @@ void the_camera_loop (void* pvParameter) {
 
   while (1) {
 
+    if (safe_stop_requested && frame_cnt == 0) {
+      park_camera_for_safe_shutdown();
+      return;
+    }
+
     // if (frame_cnt == 0 && start_record == 0)  // do nothing
     // if (frame_cnt == 0 && start_record == 1)  // start a movie
     // if (frame_cnt > 0 && start_record == 0)   // stop the movie
@@ -2816,12 +2937,10 @@ void the_camera_loop (void* pvParameter) {
       esp_camera_fb_return(fb_curr);
       fb_curr = NULL;
 
+      bool completed_video = frame_cnt >= 5;
       end_avi();                                // end the movie
 
       //if (blinking) digitalWrite(21, HIGH);          // light off
-
-      delete_old_stuff_flag = 1;
-      delay(50);
 
       avi_end_time = millis();
 
@@ -2829,6 +2948,34 @@ void the_camera_loop (void* pvParameter) {
 
       Serial.printf("End the avi at %d.  It was %d frames, %d ms at %.2f fps...\n", millis(), frame_cnt, avi_end_time, avi_end_time - avi_start_time, fps);
       logfile.printf("End the avi at %d.  It was %d frames, %d ms at %.2f fps...\n", millis(), frame_cnt, avi_end_time, avi_end_time - avi_start_time, fps);
+
+      if (completed_video) {
+        completed_recordings++;
+        Serial.printf("Completed recordings: %u", completed_recordings);
+        logfile.printf("Completed recordings: %u", completed_recordings);
+        if (max_recordings > 0) {
+          Serial.printf(" / %d\n", max_recordings);
+          logfile.printf(" / %d\n", max_recordings);
+        } else {
+          Serial.println(" / unlimited");
+          logfile.println(" / unlimited");
+        }
+
+        if (max_recordings > 0 && completed_recordings >= (uint32_t)max_recordings) {
+          safe_stop_requested = true;
+          Serial.println("Configured recording count reached: safely stopping.");
+          logfile.println("Configured recording count reached: safely stopping.");
+        }
+      }
+
+      if (safe_stop_requested) {
+        frame_cnt = 0;
+        park_camera_for_safe_shutdown();
+        return;
+      }
+
+      delete_old_stuff_flag = 1;
+      delay(50);
 
       if (!reboot_now) frame_cnt = 0;             // start recording again on the next loop
 
