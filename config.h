@@ -5,6 +5,7 @@
 const char config_txt[] PROGMEM = R"CONFIG(desklens  // camera name and mDNS host: http://desklens.local/
 11  // frame size: 11=HD (1280x720)
 1800  // recording length in seconds
+0  // recording count; 0=unlimited
 0  // recording frame interval in ms; 0=fastest
 1  // playback speed multiplier; 1=real time
 0  // live stream frame interval in ms; 0=fastest
@@ -12,7 +13,6 @@ GMT  // timezone
 0  // wifi mode: 0=off, 1=sta, 2=ap
 YOUR_WIFI_SSID  // STA network SSID, or ESP32 AP name in AP mode
 YOUR_WIFI_PASSWORD  // STA password, or ESP32 AP password (8-63 chars) in AP mode
-0  // recording count; 0=unlimited
 0  // STA IP mode: 0=DHCP/mDNS, 1=static IPv4
 192.168.1.123  // static IPv4 address; used only when STA IP mode=1
 192.168.1.1  // gateway; used only when STA IP mode=1

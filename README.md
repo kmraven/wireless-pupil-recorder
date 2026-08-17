@@ -20,27 +20,27 @@ Seeed Studio XIAO ESP32S3 Senseで、JPEGフレームをAVIとしてmicroSDカ�
 | 1 | camera name | ファイル名とmDNSホスト名。英数字とハイフンを推奨 |
 | 2 | frame size | `11`はHD（1280×720） |
 | 3 | recording length | AVI 1本の録画秒数 |
-| 4 | recording interval | 録画フレーム間隔（ms）。`0`は最速 |
-| 5 | speed multiplier | 再生速度倍率。`1`は実時間 |
-| 6 | stream interval | ライブ映像のフレーム間隔（ms）。`0`は最速 |
-| 7 | timezone | 例：`GMT` |
-| 8 | wifi mode | `0`=OFF、`1`=STA、`2`=AP |
-| 9 | Wi-Fi SSID | STAでは接続先SSID、APではESP32が作るSSID |
-| 10 | Wi-Fi password | STAでは接続先パスワード、APでは8～63文字のAPパスワード |
-| 11 | recording count | 録画するAVIの本数。`0`は無制限 |
+| 4 | recording count | 録画するAVIの本数。`0`は無制限 |
+| 5 | recording interval | 録画フレーム間隔（ms）。`0`は最速 |
+| 6 | speed multiplier | 再生速度倍率。`1`は実時間 |
+| 7 | stream interval | ライブ映像のフレーム間隔（ms）。`0`は最速 |
+| 8 | timezone | 例：`GMT` |
+| 9 | wifi mode | `0`=OFF、`1`=STA、`2`=AP |
+| 10 | Wi-Fi SSID | STAでは接続先SSID、APではESP32が作るSSID |
+| 11 | Wi-Fi password | STAでは接続先パスワード、APでは8～63文字のAPパスワード |
 | 12 | STA IP mode | `0`=DHCP/mDNS、`1`=固定IPv4 |
 | 13 | static IPv4 | 固定IPモードで使うESP32のアドレス |
 | 14 | gateway | 固定IPモードのゲートウェイ |
 | 15 | subnet mask | 固定IPモードのサブネットマスク |
 | 16 | DNS server | 固定IPモードのDNSサーバー |
 
-旧形式のconfigも読み込めます。旧形式では8行目が`ssid1234`ならWi-Fi OFF、`ap`または`wifiman`ならAP、それ以外ならSTAとして扱います。明示的な新形式へ移行することを推奨します。
+直前の16行形式（recording countが11行目）と、それ以前の旧形式も読み込めます。旧形式では8行目が`ssid1234`ならWi-Fi OFF、`ap`または`wifiman`ならAP、それ以外ならSTAとして扱います。新しく作るconfigでは上表の形式を使用してください。
 
 ## Wi-Fiモードと接続先
 
 ### 0: OFF
 
-Wi-FiとWebサーバーを起動しません。SDカードだけで運用するときの省電力設定です。9、10、12～16行目は使用されませんが、行位置を保つため削除しないでください。
+Wi-FiとWebサーバーを起動しません。SDカードだけで運用するときの省電力設定です。10～16行目は使用されませんが、行位置を保つため削除しないでください。
 
 ### 1: STA（ローカルWi-Fiへ接続）
 
@@ -50,11 +50,13 @@ DHCP/mDNSを使う例：
 
 ```text
 desklens  // camera name
+11  // frame size
+1800  // recording length
+0  // recording count
 ...
 1  // wifi mode
 YOUR_2G_WIFI_SSID
 YOUR_WIFI_PASSWORD
-0  // recording count
 0  // STA IP mode: DHCP/mDNS
 ```
 
@@ -80,7 +82,7 @@ STA接続に失敗してもAPへ自動移行しません。意図しない無線
 
 ### 2: AP（ESP32がWi-Fi親機になる）
 
-9、10行目で指定したSSIDとパスワードのネットワークをESP32が作ります。PCをそのSSIDへ接続し、次を開きます。
+10、11行目で指定したSSIDとパスワードのネットワークをESP32が作ります。PCをそのSSIDへ接続し、次を開きます。
 
 ```text
 http://192.168.4.1/

@@ -610,6 +610,10 @@ bool is_config_integer(const String &value) {
   return true;
 }
 
+bool is_single_digit_config_value(const String &value) {
+  return value.length() == 1 && value.charAt(0) >= '0' && value.charAt(0) <= '9';
+}
+
 void read_config_file() {
 
   // if there is a config.txt, use it plus defaults
@@ -638,6 +642,7 @@ void read_config_file() {
     desklens  // camera name
     11  // framesize  11=hd
     1800  // length of video in seconds
+    0  // recording count; 0 = unlimited
     0  // interval - ms between recording frames
     1  // speedup - multiply framerate
     0  // streamdelay - ms between streaming frames
@@ -645,7 +650,6 @@ void read_config_file() {
     0  // wifi mode: 0=off, 1=sta, 2=ap
     YOUR_WIFI_SSID  // STA network SSID, or AP name in AP mode
     YOUR_WIFI_PASSWORD  // STA password, or AP password in AP mode
-    0  // recording count; 0 = unlimited
     0  // STA IP mode: 0=DHCP/mDNS, 1=static IPv4
     192.168.1.123  // static IPv4 address
     192.168.1.1  // gateway
@@ -657,7 +661,7 @@ void read_config_file() {
     In STA/static mode, browse to the configured static IPv4 address.
     In AP mode, join the configured SSID and browse to http://192.168.4.1/.
 
-    Old config files with SSID on line 8 remain supported.
+    The previous 16-line layout and old config files with SSID on line 8 remain supported.
   */
 
   String cname = "desklens";
@@ -685,56 +689,51 @@ void read_config_file() {
   if (config_file) {
 
     Serial.println("Reading config.txt");
-    String value = read_config_value(config_file);
-    if (value.length() > 0) cname = value;
-    value = read_config_value(config_file);
-    if (is_config_integer(value)) cframesize = value.toInt();
-    value = read_config_value(config_file);
-    if (is_config_integer(value)) clength = value.toInt();
-    value = read_config_value(config_file);
-    if (is_config_integer(value)) cinterval = value.toInt();
-    value = read_config_value(config_file);
-    if (is_config_integer(value)) cspeedup = value.toInt();
-    value = read_config_value(config_file);
-    if (is_config_integer(value)) cstreamdelay = value.toInt();
-    value = read_config_value(config_file);
-    if (value.length() > 0) czone = value;
+    String config_values[16];
+    int config_value_count = 0;
+    while (config_value_count < 16 && config_file.available()) {
+      config_values[config_value_count++] = read_config_value(config_file);
+    }
+    config_file.close();
 
-    String wifi_mode_or_legacy_ssid = read_config_value(config_file);
-    bool explicit_wifi_mode = wifi_mode_or_legacy_ssid.length() == 1 &&
-                              wifi_mode_or_legacy_ssid.charAt(0) >= '0' &&
-                              wifi_mode_or_legacy_ssid.charAt(0) <= '9';
+    if (config_value_count > 0 && config_values[0].length() > 0) cname = config_values[0];
+    if (config_value_count > 1 && is_config_integer(config_values[1])) cframesize = config_values[1].toInt();
+    if (config_value_count > 2 && is_config_integer(config_values[2])) clength = config_values[2].toInt();
 
-    if (explicit_wifi_mode) {
-      cwifimode = wifi_mode_or_legacy_ssid.toInt();
-      if (cwifimode < RECORDER_WIFI_OFF || cwifimode > RECORDER_WIFI_AP) {
-        Serial.println("Invalid wifi mode; forcing WiFi off");
-        cwifimode = RECORDER_WIFI_OFF;
-      }
+    bool reordered_layout = config_value_count >= 16 && is_single_digit_config_value(config_values[8]);
+    bool previous_explicit_layout = !reordered_layout && config_value_count >= 16 &&
+                                    is_single_digit_config_value(config_values[7]);
 
-      value = read_config_value(config_file);
-      if (value.length() > 0) cssid = value;
-      value = read_config_value(config_file);
-      if (value.length() > 0) cpass = value;
-      value = read_config_value(config_file);
-      if (is_config_integer(value)) crecordingcount = value.toInt();
-      value = read_config_value(config_file);
-      if (is_config_integer(value)) cwifiipmode = value.toInt();
-      value = read_config_value(config_file);
-      if (value.length() > 0) cstaticipvalue = value;
-      value = read_config_value(config_file);
-      if (value.length() > 0) cgatewayvalue = value;
-      value = read_config_value(config_file);
-      if (value.length() > 0) csubnetvalue = value;
-      value = read_config_value(config_file);
-      if (value.length() > 0) cdnsvalue = value;
+    if (reordered_layout) {
+      // Current layout: recording count is line 4 and WiFi mode is line 9.
+      if (is_config_integer(config_values[3])) crecordingcount = config_values[3].toInt();
+      if (is_config_integer(config_values[4])) cinterval = config_values[4].toInt();
+      if (is_config_integer(config_values[5])) cspeedup = config_values[5].toInt();
+      if (is_config_integer(config_values[6])) cstreamdelay = config_values[6].toInt();
+      if (config_values[7].length() > 0) czone = config_values[7];
+      cwifimode = config_values[8].toInt();
+      if (config_values[9].length() > 0) cssid = config_values[9];
+      if (config_values[10].length() > 0) cpass = config_values[10];
+    } else if (previous_explicit_layout) {
+      // Previous 16-line layout: recording count was line 11 and WiFi mode line 8.
+      Serial.println("Previous config layout detected; recording count on line 11 is supported");
+      if (is_config_integer(config_values[3])) cinterval = config_values[3].toInt();
+      if (is_config_integer(config_values[4])) cspeedup = config_values[4].toInt();
+      if (is_config_integer(config_values[5])) cstreamdelay = config_values[5].toInt();
+      if (config_values[6].length() > 0) czone = config_values[6];
+      cwifimode = config_values[7].toInt();
+      if (config_values[8].length() > 0) cssid = config_values[8];
+      if (config_values[9].length() > 0) cpass = config_values[9];
+      if (is_config_integer(config_values[10])) crecordingcount = config_values[10].toInt();
     } else {
-      // Legacy format: line 8 was the SSID, and special SSIDs selected the mode.
-      if (wifi_mode_or_legacy_ssid.length() > 0) cssid = wifi_mode_or_legacy_ssid;
-      value = read_config_value(config_file);
-      if (value.length() > 0) cpass = value;
-      value = read_config_value(config_file);
-      if (is_config_integer(value)) crecordingcount = value.toInt();
+      // Legacy layout: line 8 was the SSID and special SSIDs selected the mode.
+      if (config_value_count > 3 && is_config_integer(config_values[3])) cinterval = config_values[3].toInt();
+      if (config_value_count > 4 && is_config_integer(config_values[4])) cspeedup = config_values[4].toInt();
+      if (config_value_count > 5 && is_config_integer(config_values[5])) cstreamdelay = config_values[5].toInt();
+      if (config_value_count > 6 && config_values[6].length() > 0) czone = config_values[6];
+      if (config_value_count > 7 && config_values[7].length() > 0) cssid = config_values[7];
+      if (config_value_count > 8 && config_values[8].length() > 0) cpass = config_values[8];
+      if (config_value_count > 9 && is_config_integer(config_values[9])) crecordingcount = config_values[9].toInt();
 
       if (cssid.equalsIgnoreCase("ssid1234")) {
         cwifimode = RECORDER_WIFI_OFF;
@@ -744,7 +743,19 @@ void read_config_file() {
         cwifimode = RECORDER_WIFI_STA;
       }
     }
-    config_file.close();
+
+    if (reordered_layout || previous_explicit_layout) {
+      if (is_config_integer(config_values[11])) cwifiipmode = config_values[11].toInt();
+      if (config_values[12].length() > 0) cstaticipvalue = config_values[12];
+      if (config_values[13].length() > 0) cgatewayvalue = config_values[13];
+      if (config_values[14].length() > 0) csubnetvalue = config_values[14];
+      if (config_values[15].length() > 0) cdnsvalue = config_values[15];
+
+      if (cwifimode < RECORDER_WIFI_OFF || cwifimode > RECORDER_WIFI_AP) {
+        Serial.println("Invalid wifi mode; forcing WiFi off");
+        cwifimode = RECORDER_WIFI_OFF;
+      }
+    }
   } else {
     Serial.println("Failed to open config.txt - writing a default");
 
