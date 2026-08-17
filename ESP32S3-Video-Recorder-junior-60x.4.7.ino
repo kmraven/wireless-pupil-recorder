@@ -677,7 +677,6 @@ void read_config_file() {
   Serial.printf("Internet %d\n", cinternet); logfile.printf("Internet %d\n", cinternet);
   Serial.printf("Zone len %d, %s\n", czone.length(), czone.c_str()); //logfile.printf("Zone len %d, %s\n", czone.length(), czone);
   Serial.printf("ssid %s\n", cssid); logfile.printf("ssid %s\n", cssid);
-  Serial.printf("pass %s\n", cpass); logfile.printf("pass %s\n", cpass);
 
 
   framesize = cframesize;
@@ -1401,7 +1400,7 @@ bool init_wifi() {
     char passch[20];
     cssid.toCharArray(ssidch, cssid.length() + 1);
     cpass.toCharArray(passch, cpass.length() + 1);
-    Serial.printf("ssid >%s<, pass >%s<\n", ssidch, passch);
+    Serial.printf("ssid >%s<\n", ssidch);
     WiFi.begin(ssidch, passch);
 
     while (WiFi.status() != WL_CONNECTED ) {

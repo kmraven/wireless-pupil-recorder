@@ -20,7 +20,7 @@
 #ifdef ESP32
 #include <WebServer.h>
 #include <FS.h>
-#include <SD_MMC.h> //jz #include <SPIFFS.h>
+#include <SD.h>
 #include <detail/RequestHandlersImpl.h>
 #endif
 

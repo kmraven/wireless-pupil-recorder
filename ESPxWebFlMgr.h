@@ -51,8 +51,9 @@
   #include <WiFi.h>
   #include <WebServer.h>
   #include <FS.h>
-  #include <SD_MMC.h> //jz #include <LittleFS.h>
-  #define ESPxWebFlMgr_FileSystem SD_MMC //jz #define ESPxWebFlMgr_FileSystem LittleFS
+  #include <SD.h>
+  // Use the same SPI-mounted SD card as the XIAO ESP32S3 recorder.
+  #define ESPxWebFlMgr_FileSystem SD
 #endif
 
 

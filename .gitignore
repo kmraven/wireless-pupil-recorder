@@ -1,0 +1,12 @@
+# Device-specific Wi-Fi configuration
+config.txt
+
+# Recorder output and runtime files
+*.avi
+*.csv
+*.log
+*.999.txt
+idx.tmp
+
+# Local OS metadata
+.DS_Store
