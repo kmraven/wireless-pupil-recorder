@@ -109,9 +109,14 @@ static const char vernum[] = "v60.4.7";
 char devname[30];
 String devstr =  "desklens";
 
-int IncludeInternet = 0;      // 0 for no internet, 1 for time only, 2  WiFiMan, 3 ssid in file, 4 ssid in file default off, 5 host mode
+enum RecorderWifiMode : uint8_t {
+  RECORDER_WIFI_OFF = 0,
+  RECORDER_WIFI_STA = 1,
+  RECORDER_WIFI_AP = 2
+};
 
-const char* ssid = "jzjzjz";
+int wifi_mode = RECORDER_WIFI_OFF;
+int wifi_ip_mode = 0;         // STA only: 0 = DHCP/mDNS, 1 = static IPv4
 
 // https://sites.google.com/a/usapiens.com/opnode/time-zones  -- find your timezone here
 String TIMEZONE = "GMT0BST,M3.5.0/01,M10.5.0/02";
@@ -146,8 +151,10 @@ volatile bool safe_stop_complete = false;
 String cssid;
 String cpass;
 String czone;
-char apssid[30];
-char appass[14];
+String cstaticip;
+String cgateway;
+String csubnet;
+String cdns;
 
 TaskHandle_t the_camera_loop_task;
 TaskHandle_t the_sd_loop_task;
@@ -571,6 +578,38 @@ static esp_err_t init_sdcard()
 
 #include "config.h" 
 
+String read_config_value(File &config_file) {
+  if (!config_file.available()) return "";
+
+  String value = config_file.readStringUntil('\n');
+  value.replace("\r", "");
+
+  // A value may contain spaces. Treat // as a comment only at the beginning
+  // of the line or when it is preceded by whitespace.
+  for (int i = 0; i + 1 < value.length(); ++i) {
+    if (value.charAt(i) == '/' && value.charAt(i + 1) == '/' &&
+        (i == 0 || value.charAt(i - 1) == ' ' || value.charAt(i - 1) == '\t')) {
+      value.remove(i);
+      break;
+    }
+  }
+
+  value.trim();
+  return value;
+}
+
+bool is_config_integer(const String &value) {
+  if (value.length() == 0) return false;
+
+  int start = value.charAt(0) == '-' ? 1 : 0;
+  if (start == value.length()) return false;
+
+  for (int i = start; i < value.length(); ++i) {
+    if (value.charAt(i) < '0' || value.charAt(i) > '9') return false;
+  }
+  return true;
+}
+
 void read_config_file() {
 
   // if there is a config.txt, use it plus defaults
@@ -595,7 +634,7 @@ void read_config_file() {
     ssid1234  // ssid
     mrpeanut  // ssid password
 
-    ~~~ new config.txt file ~~~
+    ~~~ current config.txt file ~~~
     desklens  // camera name
     11  // framesize  11=hd
     1800  // length of video in seconds
@@ -603,15 +642,23 @@ void read_config_file() {
     1  // speedup - multiply framerate
     0  // streamdelay - ms between streaming frames
     GMT // timezone
-    ssid1234  // ssid wifi name
-    mrpeanut  // ssid password
+    0  // wifi mode: 0=off, 1=sta, 2=ap
+    YOUR_WIFI_SSID  // STA network SSID, or AP name in AP mode
+    YOUR_WIFI_PASSWORD  // STA password, or AP password in AP mode
     0  // recording count; 0 = unlimited
+    0  // STA IP mode: 0=DHCP/mDNS, 1=static IPv4
+    192.168.1.123  // static IPv4 address
+    192.168.1.1  // gateway
+    255.255.255.0  // subnet mask
+    192.168.1.1  // DNS server
     ~~~
 
-    Lines above are rigid - do not delete lines, must have 2 spaces after the number or string
-  */
+    In STA/DHCP mode, browse to http://<camera-name>.local/.
+    In STA/static mode, browse to the configured static IPv4 address.
+    In AP mode, join the configured SSID and browse to http://192.168.4.1/.
 
-  String junk;
+    Old config files with SSID on line 8 remain supported.
+  */
 
   String cname = "desklens";
   int cframesize = 11;
@@ -623,59 +670,81 @@ void read_config_file() {
   int cinterval = 0;
   int cspeedup = 1;
   int cstreamdelay = 0;
-  int cinternet = 0;
+  int cwifimode = RECORDER_WIFI_OFF;
+  int cwifiipmode = 0;
   String czone = "GMT";
-  cssid = "ap";
-  cpass = "mrpeanut";
+  cssid = "ssid1234";
+  cpass = "YOUR_WIFI_PASSWORD";
   int crecordingcount = 0;
+  String cstaticipvalue = "192.168.1.123";
+  String cgatewayvalue = "192.168.1.1";
+  String csubnetvalue = "255.255.255.0";
+  String cdnsvalue = "192.168.1.1";
 
   File config_file =SD.open("/config.txt", "r");
   if (config_file) {
 
     Serial.println("Reading config.txt");
-    cname = config_file.readStringUntil(' ');
-    junk = config_file.readStringUntil('\n');
-    cframesize = config_file.parseInt();
-    junk = config_file.readStringUntil('\n');
+    String value = read_config_value(config_file);
+    if (value.length() > 0) cname = value;
+    value = read_config_value(config_file);
+    if (is_config_integer(value)) cframesize = value.toInt();
+    value = read_config_value(config_file);
+    if (is_config_integer(value)) clength = value.toInt();
+    value = read_config_value(config_file);
+    if (is_config_integer(value)) cinterval = value.toInt();
+    value = read_config_value(config_file);
+    if (is_config_integer(value)) cspeedup = value.toInt();
+    value = read_config_value(config_file);
+    if (is_config_integer(value)) cstreamdelay = value.toInt();
+    value = read_config_value(config_file);
+    if (value.length() > 0) czone = value;
 
-    clength = config_file.parseInt();
-    junk = config_file.readStringUntil('\n');
-    cinterval = config_file.parseInt();
-    junk = config_file.readStringUntil('\n');
-    cspeedup = config_file.parseInt();
-    junk = config_file.readStringUntil('\n');
-    cstreamdelay = config_file.parseInt();
-    junk = config_file.readStringUntil('\n');
-    czone = config_file.readStringUntil(' ');
-    junk = config_file.readStringUntil('\n');
-    cssid = config_file.readStringUntil(' ');
-    junk = config_file.readStringUntil('\n');
-    cpass = config_file.readStringUntil(' ');
-    junk = config_file.readStringUntil('\n');
+    String wifi_mode_or_legacy_ssid = read_config_value(config_file);
+    bool explicit_wifi_mode = wifi_mode_or_legacy_ssid.length() == 1 &&
+                              wifi_mode_or_legacy_ssid.charAt(0) >= '0' &&
+                              wifi_mode_or_legacy_ssid.charAt(0) <= '9';
 
-    // The tenth line is optional so existing nine-line config files remain valid.
-    // Read only that line; do not let parseInt() scan the explanatory text below it.
-    if (config_file.available()) {
-      String recording_count_line = config_file.readStringUntil('\n');
-      recording_count_line.trim();
-      if (recording_count_line.length() > 0) {
-        char first_character = recording_count_line.charAt(0);
-        if ((first_character >= '0' && first_character <= '9') || first_character == '-') {
-          crecordingcount = recording_count_line.toInt();
-        }
+    if (explicit_wifi_mode) {
+      cwifimode = wifi_mode_or_legacy_ssid.toInt();
+      if (cwifimode < RECORDER_WIFI_OFF || cwifimode > RECORDER_WIFI_AP) {
+        Serial.println("Invalid wifi mode; forcing WiFi off");
+        cwifimode = RECORDER_WIFI_OFF;
+      }
+
+      value = read_config_value(config_file);
+      if (value.length() > 0) cssid = value;
+      value = read_config_value(config_file);
+      if (value.length() > 0) cpass = value;
+      value = read_config_value(config_file);
+      if (is_config_integer(value)) crecordingcount = value.toInt();
+      value = read_config_value(config_file);
+      if (is_config_integer(value)) cwifiipmode = value.toInt();
+      value = read_config_value(config_file);
+      if (value.length() > 0) cstaticipvalue = value;
+      value = read_config_value(config_file);
+      if (value.length() > 0) cgatewayvalue = value;
+      value = read_config_value(config_file);
+      if (value.length() > 0) csubnetvalue = value;
+      value = read_config_value(config_file);
+      if (value.length() > 0) cdnsvalue = value;
+    } else {
+      // Legacy format: line 8 was the SSID, and special SSIDs selected the mode.
+      if (wifi_mode_or_legacy_ssid.length() > 0) cssid = wifi_mode_or_legacy_ssid;
+      value = read_config_value(config_file);
+      if (value.length() > 0) cpass = value;
+      value = read_config_value(config_file);
+      if (is_config_integer(value)) crecordingcount = value.toInt();
+
+      if (cssid.equalsIgnoreCase("ssid1234")) {
+        cwifimode = RECORDER_WIFI_OFF;
+      } else if (cssid.equalsIgnoreCase("wifiman") || cssid.equalsIgnoreCase("ap")) {
+        cwifimode = RECORDER_WIFI_AP;
+      } else {
+        cwifimode = RECORDER_WIFI_STA;
       }
     }
     config_file.close();
-
-    if (String(cssid) == "ssid1234" || String(cssid) == "Ssid1234") {
-      cinternet = 0;
-    } else if (String(cssid) == "wifiman" || String(cssid) == "Wifiman") {
-      cinternet = 5;
-    } else if (String(cssid) == "ap" || String(cssid) == "AP") {
-      cinternet = 5;
-    } else {
-      cinternet = 4;
-    }
   } else {
     Serial.println("Failed to open config.txt - writing a default");
 
@@ -683,10 +752,14 @@ void read_config_file() {
     File new_simple =SD.open("/config.txt", "w");
     new_simple.write((const uint8_t *)config_txt, config_txt_len);
     new_simple.close();
-    cinternet = 5;
+    cwifimode = RECORDER_WIFI_OFF;
   }
 
   if (crecordingcount < 0) crecordingcount = 0;
+  if (cwifiipmode != 0 && cwifiipmode != 1) {
+    Serial.println("Invalid STA IP mode; using DHCP/mDNS");
+    cwifiipmode = 0;
+  }
 
   Serial.printf("=========   Data fram config.txt and defaults  =========\n");
   Serial.printf("Name %s\n", cname); logfile.printf("Name %s\n", cname);
@@ -700,9 +773,17 @@ void read_config_file() {
   Serial.printf("Speedup %d\n", cspeedup); logfile.printf("Speedup %d\n", cspeedup);
   Serial.printf("Recording count %d (0 = unlimited)\n", crecordingcount); logfile.printf("Recording count %d (0 = unlimited)\n", crecordingcount);
   Serial.printf("Streamdelay %d\n", cstreamdelay); logfile.printf("Streamdelay %d\n", cstreamdelay);
-  Serial.printf("Internet %d\n", cinternet); logfile.printf("Internet %d\n", cinternet);
+  Serial.printf("WiFi mode %d (0=off, 1=sta, 2=ap)\n", cwifimode); logfile.printf("WiFi mode %d (0=off, 1=sta, 2=ap)\n", cwifimode);
   Serial.printf("Zone len %d, %s\n", czone.length(), czone.c_str()); //logfile.printf("Zone len %d, %s\n", czone.length(), czone);
   Serial.printf("ssid %s\n", cssid); logfile.printf("ssid %s\n", cssid);
+
+  if (cwifimode == RECORDER_WIFI_STA && cwifiipmode == 0) {
+    Serial.printf("Web address: http://%s.local/\n", cname.c_str());
+  } else if (cwifimode == RECORDER_WIFI_STA) {
+    Serial.printf("Web address: http://%s/\n", cstaticipvalue.c_str());
+  } else if (cwifimode == RECORDER_WIFI_AP) {
+    Serial.println("Web address: http://192.168.4.1/");
+  }
 
 
   framesize = cframesize;
@@ -715,11 +796,16 @@ void read_config_file() {
   speed_up_factor = cspeedup;
   stream_delay = cstreamdelay;
   max_recordings = crecordingcount;
-  IncludeInternet = cinternet;
+  wifi_mode = cwifimode;
+  wifi_ip_mode = cwifiipmode;
+  cstaticip = cstaticipvalue;
+  cgateway = cgatewayvalue;
+  csubnet = csubnetvalue;
+  cdns = cdnsvalue;
   configfile = true;
   TIMEZONE = czone;
 
-  cname.toCharArray(devname, cname.length() + 1);
+  snprintf(devname, sizeof(devname), "%s", cname.c_str());
 
 }
 
@@ -1474,42 +1560,77 @@ WiFiEventId_t eventID;
 #include "esp_wifi.h"
 
 bool init_wifi() {
-
   int connAttempts = 0;
-
   uint32_t brown_reg_temp = READ_PERI_REG(RTC_CNTL_BROWN_OUT_REG);
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  auto finish_wifi_init = [brown_reg_temp](bool success) {
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, brown_reg_temp);
+    return success;
+  };
 
-  if (IncludeInternet == 3 || IncludeInternet == 4 ) {
+  if (wifi_mode == RECORDER_WIFI_OFF) {
+    WiFi.mode(WIFI_OFF);
+    InternetOff = true;
+    return finish_wifi_init(false);
+  }
 
-    WiFi.disconnect(true, true);
-    //WiFi.mode(WIFI_STA);  // https://github.com/espressif/arduino-esp32/issues/6086
+  if (wifi_mode == RECORDER_WIFI_STA) {
+    if (cssid.length() == 0 || cssid.length() > 32 || cpass.length() > 64) {
+      Serial.println("Invalid STA SSID or password length");
+      return finish_wifi_init(false);
+    }
+
+    WiFi.disconnect(true, false);
     WiFi.setHostname(devname);
     WiFi.mode(WIFI_STA);
-    char ssidch[20];
-    char passch[20];
-    cssid.toCharArray(ssidch, cssid.length() + 1);
-    cpass.toCharArray(passch, cpass.length() + 1);
-    Serial.printf("ssid >%s<\n", ssidch);
-    WiFi.begin(ssidch, passch);
+
+    if (wifi_ip_mode == 1) {
+      IPAddress static_ip;
+      IPAddress gateway;
+      IPAddress subnet;
+      IPAddress dns;
+      if (!static_ip.fromString(cstaticip) || !gateway.fromString(cgateway) ||
+          !subnet.fromString(csubnet) || !dns.fromString(cdns)) {
+        Serial.println("Invalid static IPv4 configuration");
+        WiFi.mode(WIFI_OFF);
+        return finish_wifi_init(false);
+      }
+      if (!WiFi.config(static_ip, gateway, subnet, dns)) {
+        Serial.println("Failed to apply static IPv4 configuration");
+        WiFi.mode(WIFI_OFF);
+        return finish_wifi_init(false);
+      }
+    }
+
+    Serial.printf("Connecting to STA SSID >%s<\n", cssid.c_str());
+    WiFi.begin(cssid.c_str(), cpass.c_str());
 
     while (WiFi.status() != WL_CONNECTED ) {
       delay(1000);
       Serial.print(".");
-      if (connAttempts++ == 15) break;     // try for 15 seconds to get internet, then give up
+      if (connAttempts++ == 15) break;
     }
+
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("\nSTA connection failed; AP fallback is disabled");
+      WiFi.disconnect(true, false);
+      WiFi.mode(WIFI_OFF);
+      InternetOff = true;
+      return finish_wifi_init(false);
+    }
+
     configTime(0, 0, "pool.ntp.org");
     char tzchar[60];
 
-    TIMEZONE.toCharArray(tzchar, TIMEZONE.length() + 1);        // name of your camera for mDNS, Router, and filenames
-    //Serial.println(TIMEZONE);
+    snprintf(tzchar, sizeof(tzchar), "%s", TIMEZONE.c_str());
     Serial.printf("Char >%s<\n", tzchar);
-    setenv("TZ", tzchar, 1);  // mountain time zone from #define at top
+    setenv("TZ", tzchar, 1);
     tzset();
 
     time(&now);
 
-    while (now < 15) {        // try for 15 seconds to get the time, then give up - 10 seconds after boot
+    int timeAttempts = 0;
+    while (now < 15 && timeAttempts++ < 15) {
       delay(1000);
       Serial.print("o");
       time(&now);
@@ -1520,12 +1641,6 @@ bool init_wifi() {
     Serial.print("IP: "); Serial.println(localip); Serial.println(" ");
     InternetOff = false;
 
-    if (!MDNS.begin(devname)) {
-      Serial.println("Error setting up MDNS responder!");
-    } else {
-      Serial.printf("mDNS responder started '%s'\n", devname);
-    }
-
     eventID = WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
       //  info.disconnected.reason ==>  info.wifi_sta_disconnected.reason - update with esp32_arduino 2.00 v58
       if (info.wifi_sta_disconnected.reason != 201) {
@@ -1533,19 +1648,27 @@ bool init_wifi() {
         logfile.printf("\nframe_cnt: %8d, WiFi event Reason: %d , Status: %d\n", frame_cnt, info.wifi_sta_disconnected.reason, WiFi.status());
       }
     });
-  }
+  } else if (wifi_mode == RECORDER_WIFI_AP) {
+    if (cssid.length() == 0 || cssid.length() > 32 ||
+        cpass.length() < 8 || cpass.length() > 63) {
+      Serial.println("AP SSID must be 1-32 characters and password 8-63 characters");
+      return finish_wifi_init(false);
+    }
 
-  if (IncludeInternet == 5 || WiFi.status() != WL_CONNECTED) {
-
-    // Connect to Wi-Fi network with SSID and password
-    Serial.print("Setting AP (Access Point)…");
-    // Remove the password parameter, if you want the AP (Access Point) to be open
-
+    Serial.printf("Setting AP with SSID >%s<\n", cssid.c_str());
     WiFi.setHostname(devname);
     WiFi.mode(WIFI_MODE_AP);
-    //WiFi.disconnect(true);
 
-    WiFi.softAP(apssid, appass);
+    IPAddress ap_ip(192, 168, 4, 1);
+    IPAddress ap_gateway(192, 168, 4, 1);
+    IPAddress ap_subnet(255, 255, 255, 0);
+    if (!WiFi.softAPConfig(ap_ip, ap_gateway, ap_subnet) ||
+        !WiFi.softAP(cssid.c_str(), cpass.c_str())) {
+      Serial.println("Failed to start AP");
+      WiFi.mode(WIFI_OFF);
+      InternetOff = true;
+      return finish_wifi_init(false);
+    }
 
     IPAddress IP = WiFi.softAPIP();
     Serial.print("AP IP address: ");
@@ -1553,15 +1676,14 @@ bool init_wifi() {
 
     sprintf(localip, "%s", WiFi.softAPIP().toString().c_str());
     Serial.print("IP: "); Serial.println(localip); Serial.println(" ");
-
-    if (!MDNS.begin(devname)) {
-      Serial.println("Error setting up MDNS responder!");
-    } else {
-      Serial.printf("mDNS responder started '%s'\n", devname);
-    }
-
     InternetOff = false;
+  }
 
+  if (!MDNS.begin(devname)) {
+    Serial.println("Error setting up MDNS responder!");
+  } else {
+    MDNS.addService("http", "tcp", 80);
+    Serial.printf("mDNS responder started: http://%s.local/\n", devname);
   }
 
   //typedef enum {
@@ -1574,15 +1696,14 @@ bool init_wifi() {
 
   wifi_ps_type_t the_type;
 
-  esp_err_t get_ps = esp_wifi_get_ps(&the_type);
+  esp_wifi_get_ps(&the_type);
   //Serial.printf("The power save was: %d\n", the_type);
   //Serial.printf("Set power save to %d\n", WIFI_PS_NONE);
-  esp_err_t set_ps = esp_wifi_set_ps(WIFI_PS_NONE);
-  esp_err_t new_ps = esp_wifi_get_ps(&the_type);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  esp_wifi_get_ps(&the_type);
   Serial.printf("The power save is : %d\n", the_type);
 
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, brown_reg_temp);
-  return true;
+  return finish_wifi_init(true);
 }
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2620,20 +2741,10 @@ void setup() {
 
   read_config_file();
 
-  String wifiMacString = WiFi.macAddress();
-  //Serial.println(wifiMacString);
-  String idfver = esp_get_idf_version();
-  //Serial.println(esp_get_idf_version());
-
-  String AP_password =  idfver.substring(9, 13) +  wifiMacString.substring(9, 11) + wifiMacString.substring(15, 17) + "jz60";
-  //Serial.print("AP Password  >>>>"); Serial.print(AP_password); Serial.println("<");
-  String AP_ssid = String(devname) + "_" + wifiMacString.substring(15, 17);
-
-  sprintf(apssid, "%s", AP_ssid.c_str());
-  sprintf(appass, "%s", AP_password.c_str());
-
-  Serial.print(">>>>>>>>>>>>>>>>>>>>> "); Serial.println(apssid);
-  Serial.print(">>>>>>>>>>>>>>>>>>>>> "); Serial.println(appass);
+  if (wifi_mode == RECORDER_WIFI_OFF) {
+    WiFi.mode(WIFI_OFF);
+    InternetOff = true;
+  }
 
   char logname[50];
   sprintf(logname, "/%s%04d.999.txt",  devname, file_group);
@@ -2668,38 +2779,11 @@ void setup() {
   if (!logfile) {
     Serial.println("Failed to open logfile for writing");
   }
-  /*
-    if (IncludeInternet > 0) {
-    Serial.println("Starting the wifi ...");
-    init_wifi();
-    InternetOff = false;
-    } else {
-    Serial.println("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
-    Serial.println("You have not wifi - no streamning, no file manager");
-    Serial.println("Put your ssid and password in config.txt on the sd card");
-    Serial.println("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
-    }
-  */
   Serial.println("Setting up the camera ...");
   config_camera();
 
   Serial.println("Checking SD for available space ...");
   delete_old_stuff();
-  /*
-    if ( !InternetOff && IncludeInternet == 1) {
-      Serial.printf("Shutting off WiFi now \n\n");
-      delay(1000);
-      WiFi.disconnect();
-      InternetOff = true;
-    }
-
-    if ( !InternetOff && IncludeInternet > 1) {
-      Serial.println("Starting Web Services ...");
-      startCameraServer();
-      start_Stream_81_server();
-      start_Stream_82_server();
-    }
-  */
   framebuffer = (uint8_t*)ps_malloc(512 * 1024); // buffer to store a jpg in motion // needs to be larger for big frames from ov5640
   framebuffer2 = (uint8_t*)ps_malloc(512 * 1024); // buffer to store a jpg in motion // needs to be larger for big frames from ov5640
   framebuffer3 = (uint8_t*)ps_malloc(512 * 1024); // buffer to store a jpg in motion // needs to be larger for big frames from ov5640
@@ -2732,7 +2816,7 @@ void setup() {
   const char *strdate = ctime(&now);
   logfile.println(strdate);
 
-  if ( !InternetOff && IncludeInternet == 5 ) {
+  if ( !InternetOff && wifi_mode == RECORDER_WIFI_AP ) {
     filemgr.begin();
     filemgr.setBackGroundColor("Gray");
     Serial.print("Open Filemanager with http://");
@@ -2741,7 +2825,7 @@ void setup() {
     Serial.print(filemanagerport);
     Serial.print("/");
     Serial.println();
-  } else   if ( !InternetOff && IncludeInternet > 1 ) {
+  } else if ( !InternetOff && wifi_mode == RECORDER_WIFI_STA ) {
     filemgr.begin();
     filemgr.setBackGroundColor("Gray");
     Serial.print("Open Filemanager with http://");
@@ -2823,7 +2907,7 @@ void loop() {
   delay(20);
   read13 = read13 + digitalRead(44); // Pin 13を44に変更 // get 2 opinions to help poor soldering
 
-  if (IncludeInternet == 4 || IncludeInternet == 2 || IncludeInternet == 5) {  // 4 is oppoiste of 3, so, flip read13
+  if (wifi_mode != RECORDER_WIFI_OFF) {
     if (read13 > 0) {
       read13 = 0;
     } else {
@@ -2831,7 +2915,7 @@ void loop() {
     }
   }
 
-  if (IncludeInternet > 1) {
+  if (wifi_mode != RECORDER_WIFI_OFF) {
     if (read13 == 2 && !InternetOff) {
       Serial.println("Shutting off wifi ..."); logfile.println("Shutting off wifi ...");
       filemgr.end();
@@ -2841,22 +2925,27 @@ void loop() {
       WiFi.disconnect();
       InternetOff = true;
     }
-    if (read13 == 0 && InternetOff) {
+    static uint32_t next_wifi_retry = 0;
+    if (read13 == 0 && InternetOff && (int32_t)(millis() - next_wifi_retry) >= 0) {
+      next_wifi_retry = millis() + 30000;
       Serial.println("Starting the wifi ...");  logfile.println("Starting the wifi ...");
-      init_wifi();
-      Serial.println("Starting Web Services ...");
-      startCameraServer();
-      start_Stream_81_server();
-      start_Stream_82_server();
-      filemgr.begin();
-      InternetOff = false;
+      if (init_wifi()) {
+        Serial.println("Starting Web Services ...");
+        startCameraServer();
+        start_Stream_81_server();
+        start_Stream_82_server();
+        filemgr.begin();
+        InternetOff = false;
+      } else {
+        Serial.println("WiFi start failed; retrying in 30 seconds");
+      }
     }
   }
 
   wakeup = millis();
   if (!InternetOff && (wakeup - last_wakeup > (15  * 60 * 1000) )) {       // 15 minutes追加インターネットoff
     last_wakeup = millis();
-    if (!InternetOff && IncludeInternet != 5) {
+    if (!InternetOff && wifi_mode == RECORDER_WIFI_STA) {
       if (WiFi.status() != WL_CONNECTED) {
 
         Serial.println("***** WiFi reconnect *****");

@@ -1,8 +1,4 @@
-#pragma once
-
-// Written to /config.txt when the SD card does not already contain one.
-// Keep this template in sync with config.example.txt and README.md.
-const char config_txt[] PROGMEM = R"CONFIG(desklens  // camera name and mDNS host: http://desklens.local/
+desklens  // camera name and mDNS host: http://desklens.local/
 11  // frame size: 11=HD (1280x720)
 1800  // recording length in seconds
 0  // recording frame interval in ms; 0=fastest
@@ -25,6 +21,3 @@ Connection addresses:
 - AP: join the configured AP SSID, then open http://192.168.4.1/
 - Live MJPEG stream: append :81/stream or :82/stream
 - SD file manager: append :8080/
-)CONFIG";
-
-const size_t config_txt_len = sizeof(config_txt) - 1;
