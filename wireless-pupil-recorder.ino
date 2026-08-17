@@ -117,6 +117,8 @@ enum RecorderWifiMode : uint8_t {
 
 int wifi_mode = RECORDER_WIFI_OFF;
 int wifi_ip_mode = 0;         // STA only: 0 = DHCP/mDNS, 1 = static IPv4
+bool startup_ntp_sync = false; // WiFi OFF only: briefly use STA at boot, then turn WiFi off
+bool system_time_valid = false;
 
 // https://sites.google.com/a/usapiens.com/opnode/time-zones  -- find your timezone here
 String TIMEZONE = "GMT0BST,M3.5.0/01,M10.5.0/02";
@@ -154,7 +156,7 @@ String czone;
 String cstaticip;
 String cgateway;
 String csubnet;
-String cdns;
+String configured_dns;
 
 TaskHandle_t the_camera_loop_task;
 TaskHandle_t the_sd_loop_task;
@@ -201,7 +203,6 @@ camera_fb_t * fb_next = NULL;
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "soc/soc.h"
-#include "soc/cpu.h"
 #include "soc/rtc_cntl_reg.h"
 
 static esp_err_t cam_err;
@@ -646,15 +647,16 @@ void read_config_file() {
     0  // interval - ms between recording frames
     1  // speedup - multiply framerate
     0  // streamdelay - ms between streaming frames
-    GMT // timezone
+    JST-9 // timezone; use JST-9 for Japan
     0  // wifi mode: 0=off, 1=sta, 2=ap
-    YOUR_WIFI_SSID  // STA network SSID, or AP name in AP mode
-    YOUR_WIFI_PASSWORD  // STA password, or AP password in AP mode
-    0  // STA IP mode: 0=DHCP/mDNS, 1=static IPv4
+    YOUR_WIFI_SSID  // local STA SSID for STA/startup NTP, or AP name in AP mode
+    YOUR_WIFI_PASSWORD  // local STA password for STA/startup NTP, or AP password in AP mode
+    0  // STA IP mode for STA/startup NTP: 0=DHCP/mDNS, 1=static IPv4
     192.168.1.123  // static IPv4 address
     192.168.1.1  // gateway
     255.255.255.0  // subnet mask
     192.168.1.1  // DNS server
+    1  // startup NTP sync: 0=off, 1=briefly connect as STA before recording
     ~~~
 
     In STA/DHCP mode, browse to http://<camera-name>.local/.
@@ -684,14 +686,15 @@ void read_config_file() {
   String cgatewayvalue = "192.168.1.1";
   String csubnetvalue = "255.255.255.0";
   String cdnsvalue = "192.168.1.1";
+  int cstartupntpsync = 0;
 
   File config_file =SD.open("/config.txt", "r");
   if (config_file) {
 
     Serial.println("Reading config.txt");
-    String config_values[16];
+    String config_values[17];
     int config_value_count = 0;
-    while (config_value_count < 16 && config_file.available()) {
+    while (config_value_count < 17 && config_file.available()) {
       config_values[config_value_count++] = read_config_value(config_file);
     }
     config_file.close();
@@ -750,6 +753,9 @@ void read_config_file() {
       if (config_values[13].length() > 0) cgatewayvalue = config_values[13];
       if (config_values[14].length() > 0) csubnetvalue = config_values[14];
       if (config_values[15].length() > 0) cdnsvalue = config_values[15];
+      if (config_value_count > 16 && is_config_integer(config_values[16])) {
+        cstartupntpsync = config_values[16].toInt();
+      }
 
       if (cwifimode < RECORDER_WIFI_OFF || cwifimode > RECORDER_WIFI_AP) {
         Serial.println("Invalid wifi mode; forcing WiFi off");
@@ -771,9 +777,13 @@ void read_config_file() {
     Serial.println("Invalid STA IP mode; using DHCP/mDNS");
     cwifiipmode = 0;
   }
+  if (cstartupntpsync != 0 && cstartupntpsync != 1) {
+    Serial.println("Invalid startup NTP sync setting; disabling it");
+    cstartupntpsync = 0;
+  }
 
   Serial.printf("=========   Data fram config.txt and defaults  =========\n");
-  Serial.printf("Name %s\n", cname); logfile.printf("Name %s\n", cname);
+  Serial.printf("Name %s\n", cname.c_str()); logfile.printf("Name %s\n", cname.c_str());
   Serial.printf("Framesize %d\n", cframesize); logfile.printf("Framesize %d\n", cframesize);
   Serial.printf("Quality %d\n", cquality); logfile.printf("Quality %d\n", cquality);
   Serial.printf("Framesize config %d\n", cframesizeconfig); logfile.printf("Framesize config%d\n", cframesizeconfig);
@@ -785,8 +795,9 @@ void read_config_file() {
   Serial.printf("Recording count %d (0 = unlimited)\n", crecordingcount); logfile.printf("Recording count %d (0 = unlimited)\n", crecordingcount);
   Serial.printf("Streamdelay %d\n", cstreamdelay); logfile.printf("Streamdelay %d\n", cstreamdelay);
   Serial.printf("WiFi mode %d (0=off, 1=sta, 2=ap)\n", cwifimode); logfile.printf("WiFi mode %d (0=off, 1=sta, 2=ap)\n", cwifimode);
+  Serial.printf("Startup NTP sync %d (0=off, 1=on)\n", cstartupntpsync); logfile.printf("Startup NTP sync %d (0=off, 1=on)\n", cstartupntpsync);
   Serial.printf("Zone len %d, %s\n", czone.length(), czone.c_str()); //logfile.printf("Zone len %d, %s\n", czone.length(), czone);
-  Serial.printf("ssid %s\n", cssid); logfile.printf("ssid %s\n", cssid);
+  Serial.printf("ssid %s\n", cssid.c_str()); logfile.printf("ssid %s\n", cssid.c_str());
 
   if (cwifimode == RECORDER_WIFI_STA && cwifiipmode == 0) {
     Serial.printf("Web address: http://%s.local/\n", cname.c_str());
@@ -809,10 +820,11 @@ void read_config_file() {
   max_recordings = crecordingcount;
   wifi_mode = cwifimode;
   wifi_ip_mode = cwifiipmode;
+  startup_ntp_sync = cstartupntpsync == 1;
   cstaticip = cstaticipvalue;
   cgateway = cgatewayvalue;
   csubnet = csubnetvalue;
-  cdns = cdnsvalue;
+  configured_dns = cdnsvalue;
   configfile = true;
   TIMEZONE = czone;
 
@@ -1570,8 +1582,130 @@ char localip[20];
 WiFiEventId_t eventID;
 #include "esp_wifi.h"
 
+const time_t MIN_VALID_SYSTEM_TIME = 1704067200; // 2024-01-01 00:00:00 UTC
+
+void apply_configured_timezone() {
+  char tzchar[60];
+  snprintf(tzchar, sizeof(tzchar), "%s", TIMEZONE.c_str());
+  setenv("TZ", tzchar, 1);
+  tzset();
+  Serial.printf("Timezone >%s<\n", tzchar);
+}
+
+bool has_valid_sta_credentials() {
+  if (cssid.length() == 0 || cssid.length() > 32 || cpass.length() > 64) {
+    Serial.println("Invalid STA SSID or password length");
+    return false;
+  }
+  if (cssid.equalsIgnoreCase("ssid1234") || cssid == "YOUR_WIFI_SSID" ||
+      cpass == "YOUR_WIFI_PASSWORD") {
+    Serial.println("STA credentials are still placeholders");
+    return false;
+  }
+  return true;
+}
+
+void stop_wifi_completely() {
+  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_OFF);
+  InternetOff = true;
+}
+
+bool apply_sta_ip_configuration() {
+  if (wifi_ip_mode == 0) return true;
+
+  IPAddress static_ip;
+  IPAddress gateway;
+  IPAddress subnet;
+  IPAddress dns;
+  if (!static_ip.fromString(cstaticip) || !gateway.fromString(cgateway) ||
+      !subnet.fromString(csubnet) || !dns.fromString(configured_dns)) {
+    Serial.println("Invalid static IPv4 configuration");
+    return false;
+  }
+  if (!WiFi.config(static_ip, gateway, subnet, dns)) {
+    Serial.println("Failed to apply static IPv4 configuration");
+    return false;
+  }
+  return true;
+}
+
+bool connect_to_sta() {
+  if (!has_valid_sta_credentials()) {
+    stop_wifi_completely();
+    return false;
+  }
+
+  WiFi.disconnect(true, false);
+  WiFi.setHostname(devname);
+  WiFi.mode(WIFI_STA);
+
+  if (!apply_sta_ip_configuration()) {
+    stop_wifi_completely();
+    return false;
+  }
+
+  Serial.printf("Connecting to STA SSID >%s<\n", cssid.c_str());
+  WiFi.begin(cssid.c_str(), cpass.c_str());
+
+  for (int conn_attempts = 0;
+       WiFi.status() != WL_CONNECTED && conn_attempts < 16;
+       ++conn_attempts) {
+    delay(1000);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nSTA connection failed; AP fallback is disabled");
+    stop_wifi_completely();
+    return false;
+  }
+
+  sprintf(localip, "%s", WiFi.localIP().toString().c_str());
+  Serial.print("\nIP: "); Serial.println(localip);
+  return true;
+}
+
+bool sync_system_time_from_ntp() {
+  apply_configured_timezone();
+  configTime(0, 0, "pool.ntp.org");
+
+  for (int time_attempts = 0; time_attempts < 15; ++time_attempts) {
+    time(&now);
+    if (now >= MIN_VALID_SYSTEM_TIME) {
+      system_time_valid = true;
+      Serial.print("NTP synchronized. Local time: "); Serial.print(ctime(&now));
+      return true;
+    }
+    delay(1000);
+    Serial.print("o");
+  }
+
+  time(&now);
+  system_time_valid = now >= MIN_VALID_SYSTEM_TIME;
+  if (!system_time_valid) {
+    Serial.println("\nNTP synchronization timed out; file dates may be incorrect");
+  }
+  return system_time_valid;
+}
+
+bool sync_time_at_startup_then_stop_wifi() {
+  Serial.println("Starting WiFi briefly for startup NTP synchronization ...");
+  uint32_t brown_reg_temp = READ_PERI_REG(RTC_CNTL_BROWN_OUT_REG);
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  bool synchronized = false;
+  if (connect_to_sta()) {
+    synchronized = sync_system_time_from_ntp();
+  }
+
+  stop_wifi_completely();
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, brown_reg_temp);
+  Serial.println("Startup NTP attempt finished; WiFi is now off");
+  return synchronized;
+}
+
 bool init_wifi() {
-  int connAttempts = 0;
   uint32_t brown_reg_temp = READ_PERI_REG(RTC_CNTL_BROWN_OUT_REG);
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   auto finish_wifi_init = [brown_reg_temp](bool success) {
@@ -1580,76 +1714,16 @@ bool init_wifi() {
   };
 
   if (wifi_mode == RECORDER_WIFI_OFF) {
-    WiFi.mode(WIFI_OFF);
-    InternetOff = true;
+    stop_wifi_completely();
     return finish_wifi_init(false);
   }
 
   if (wifi_mode == RECORDER_WIFI_STA) {
-    if (cssid.length() == 0 || cssid.length() > 32 || cpass.length() > 64) {
-      Serial.println("Invalid STA SSID or password length");
+    if (!connect_to_sta()) {
       return finish_wifi_init(false);
     }
 
-    WiFi.disconnect(true, false);
-    WiFi.setHostname(devname);
-    WiFi.mode(WIFI_STA);
-
-    if (wifi_ip_mode == 1) {
-      IPAddress static_ip;
-      IPAddress gateway;
-      IPAddress subnet;
-      IPAddress dns;
-      if (!static_ip.fromString(cstaticip) || !gateway.fromString(cgateway) ||
-          !subnet.fromString(csubnet) || !dns.fromString(cdns)) {
-        Serial.println("Invalid static IPv4 configuration");
-        WiFi.mode(WIFI_OFF);
-        return finish_wifi_init(false);
-      }
-      if (!WiFi.config(static_ip, gateway, subnet, dns)) {
-        Serial.println("Failed to apply static IPv4 configuration");
-        WiFi.mode(WIFI_OFF);
-        return finish_wifi_init(false);
-      }
-    }
-
-    Serial.printf("Connecting to STA SSID >%s<\n", cssid.c_str());
-    WiFi.begin(cssid.c_str(), cpass.c_str());
-
-    while (WiFi.status() != WL_CONNECTED ) {
-      delay(1000);
-      Serial.print(".");
-      if (connAttempts++ == 15) break;
-    }
-
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("\nSTA connection failed; AP fallback is disabled");
-      WiFi.disconnect(true, false);
-      WiFi.mode(WIFI_OFF);
-      InternetOff = true;
-      return finish_wifi_init(false);
-    }
-
-    configTime(0, 0, "pool.ntp.org");
-    char tzchar[60];
-
-    snprintf(tzchar, sizeof(tzchar), "%s", TIMEZONE.c_str());
-    Serial.printf("Char >%s<\n", tzchar);
-    setenv("TZ", tzchar, 1);
-    tzset();
-
-    time(&now);
-
-    int timeAttempts = 0;
-    while (now < 15 && timeAttempts++ < 15) {
-      delay(1000);
-      Serial.print("o");
-      time(&now);
-    }
-
-    Serial.print("\nLocal time: "); Serial.print(ctime(&now));
-    sprintf(localip, "%s", WiFi.localIP().toString().c_str());
-    Serial.print("IP: "); Serial.println(localip); Serial.println(" ");
+    sync_system_time_from_ntp();
     InternetOff = false;
 
     eventID = WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
@@ -2752,9 +2826,27 @@ void setup() {
 
   read_config_file();
 
-  if (wifi_mode == RECORDER_WIFI_OFF) {
-    WiFi.mode(WIFI_OFF);
-    InternetOff = true;
+  apply_configured_timezone();
+  time(&now);
+  system_time_valid = now >= MIN_VALID_SYSTEM_TIME;
+
+  // Set the system clock before opening output files so FAT timestamps are valid.
+  if (wifi_mode == RECORDER_WIFI_STA) {
+    Serial.println("Starting STA before creating files to synchronize time ...");
+    init_wifi();
+  } else if (wifi_mode == RECORDER_WIFI_OFF) {
+    stop_wifi_completely();
+    if (startup_ntp_sync) {
+      sync_time_at_startup_then_stop_wifi();
+    }
+  } else if (startup_ntp_sync) {
+    Serial.println("Startup NTP sync is ignored in AP mode; AP credentials cannot be used for STA");
+  }
+
+  time(&now);
+  system_time_valid = now >= MIN_VALID_SYSTEM_TIME;
+  if (!system_time_valid) {
+    Serial.println("WARNING: System time is not synchronized; FAT file dates may be incorrect");
   }
 
   char logname[50];
@@ -2826,6 +2918,13 @@ void setup() {
 
   const char *strdate = ctime(&now);
   logfile.println(strdate);
+
+  if (!InternetOff) {
+    Serial.println("Starting Web Services ...");
+    startCameraServer();
+    start_Stream_81_server();
+    start_Stream_82_server();
+  }
 
   if ( !InternetOff && wifi_mode == RECORDER_WIFI_AP ) {
     filemgr.begin();

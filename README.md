@@ -2,6 +2,10 @@
 
 Seeed Studio XIAO ESP32S3 Senseで、JPEGフレームをAVIとしてmicroSDカードへ録画するスケッチです。録画しながら、必要に応じてローカルWi-Fi経由でライブ映像やSDカード内のファイルを確認できます。
 
+## Arduino IDEの設定
+
+書き込み前に、ボードを`XIAO_ESP32S3`、PSRAMを`OPI PSRAM`に設定してください。PSRAMが無効だと、起動ログに`SPIRam Total heap 0`や`frame buffer malloc failed`と表示され、カメラを初期化できません。
+
 ## 基本的な使い方
 
 1. `config.example.txt`を`config.txt`という名前でmicroSDカードのルートへコピーします。
@@ -24,27 +28,45 @@ Seeed Studio XIAO ESP32S3 Senseで、JPEGフレームをAVIとしてmicroSDカ�
 | 5 | recording interval | 録画フレーム間隔（ms）。`0`は最速 |
 | 6 | speed multiplier | 再生速度倍率。`1`は実時間 |
 | 7 | stream interval | ライブ映像のフレーム間隔（ms）。`0`は最速 |
-| 8 | timezone | 例：`GMT` |
+| 8 | timezone | 日本では`JST-9`。UTCなら`GMT` |
 | 9 | wifi mode | `0`=OFF、`1`=STA、`2`=AP |
-| 10 | Wi-Fi SSID | STAでは接続先SSID、APではESP32が作るSSID |
-| 11 | Wi-Fi password | STAでは接続先パスワード、APでは8～63文字のAPパスワード |
-| 12 | STA IP mode | `0`=DHCP/mDNS、`1`=固定IPv4 |
+| 10 | Wi-Fi SSID | STA／起動時NTPでは接続先SSID、APではESP32が作るSSID |
+| 11 | Wi-Fi password | STA／起動時NTPでは接続先パスワード、APでは8～63文字のAPパスワード |
+| 12 | STA IP mode | STA／起動時NTPで使用。`0`=DHCP/mDNS、`1`=固定IPv4 |
 | 13 | static IPv4 | 固定IPモードで使うESP32のアドレス |
 | 14 | gateway | 固定IPモードのゲートウェイ |
 | 15 | subnet mask | 固定IPモードのサブネットマスク |
 | 16 | DNS server | 固定IPモードのDNSサーバー |
+| 17 | startup NTP sync | `0`=無効、`1`=起動時だけSTA接続して日時を同期 |
 
-直前の16行形式（recording countが11行目）と、それ以前の旧形式も読み込めます。旧形式では8行目が`ssid1234`ならWi-Fi OFF、`ap`または`wifiman`ならAP、それ以外ならSTAとして扱います。新しく作るconfigでは上表の形式を使用してください。
+直前の16行形式（recording countが11行目）と、それ以前の旧形式も読み込めます。16行形式では起動時NTP同期は無効になります。有効にするには末尾へ17行目の`1`を追加してください。旧形式では8行目が`ssid1234`ならWi-Fi OFF、`ap`または`wifiman`ならAP、それ以外ならSTAとして扱います。新しく作るconfigでは上表の形式を使用してください。
 
 ## Wi-Fiモードと接続先
 
 ### 0: OFF
 
-Wi-FiとWebサーバーを起動しません。SDカードだけで運用するときの省電力設定です。10～16行目は使用されませんが、行位置を保つため削除しないでください。
+録画中はWi-FiとWebサーバーを起動しない、SDカード運用向けの省電力設定です。
+
+17行目が`1`の場合は、起動時だけ10～16行目の設定でローカルWi-Fiへ接続し、NTPで日時を取得します。同期後はWi-Fiを完全に停止してから録画を始めます。日時同期には、そのネットワークから`pool.ntp.org`へ接続できる必要があります。
+
+```text
+JST-9  // timezone
+0  // wifi mode: off while recording
+YOUR_2G_WIFI_SSID
+YOUR_WIFI_PASSWORD
+0  // DHCP/mDNS
+192.168.1.123
+192.168.1.1
+255.255.255.0
+192.168.1.1
+1  // startup NTP sync
+```
+
+NTP同期が15秒以内に完了しなかった場合も録画は続行しますが、シリアルログへ警告を表示し、その回のファイル日時は正しくない可能性があります。
 
 ### 1: STA（ローカルWi-Fiへ接続）
 
-XIAO ESP32S3 Senseは2.4 GHz Wi-Fiへ接続します。PCも同じローカルネットワークへ接続してください。
+XIAO ESP32S3 Senseは2.4 GHz Wi-Fiへ接続します。出力ファイルを作る前にNTP同期し、録画中もWi-Fiを維持します。PCも同じローカルネットワークへ接続してください。17行目の設定はSTAモードでは使用しません。
 
 DHCP/mDNSを使う例：
 
@@ -89,6 +111,12 @@ http://192.168.4.1/
 ```
 
 APのIPはコードで`192.168.4.1`へ固定されています。
+
+AP用SSIDとローカルWi-FiのSSIDを同時には指定できないため、起動時NTP同期はAPモードでは使用しません。
+
+## ファイルの日時
+
+NTP同期が成功してからAVI、ログ、CSVを作成するため、microSDカード上のFAT作成日時・更新日時に実日時が記録されます。シリアルログに`NTP synchronized`と表示されれば同期成功です。完全な電源断後はESP32単体では実日時を保持できないため、Wi-Fiを使わない場合は日時を保証できません。
 
 ## Web画面
 
