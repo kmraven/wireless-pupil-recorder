@@ -131,6 +131,8 @@ int stream_delay = 500;           // minimum of 500 ms delay between frames
 int MagicNumber = 12;                // change this number to reset the eprom in your esp32 for file numbers
 int max_recordings = 0;           // 0 records continuously until stopped
 uint32_t completed_recordings = 0;
+const uint32_t AVI_FLUSH_INTERVAL_MS = 1000;
+uint32_t last_avi_flush_time = 0;
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -533,6 +535,7 @@ static void config_camera() {
 #define SD_SPI_MISO  8
 #define SD_SPI_SCK   7
 #define SD_SPI_CS    21
+const uint32_t SD_SPI_FREQUENCY = 10000000;
 
 static esp_err_t init_sdcard()
 {
@@ -542,7 +545,7 @@ static esp_err_t init_sdcard()
   
   // 2. SD.hライブラリを使用してSDカードを初期化
   // SD.begin()の呼び出しは、SPIバスが設定された後に行う
-  if (!SD.begin(SD_SPI_CS)) {
+  if (!SD.begin(SD_SPI_CS, SPI, SD_SPI_FREQUENCY)) {
     Serial.println("SD card initialization failed! (SPI Mode)");
     // 元のコードのメッセージとMajor Failを発動
     // 付近の Major Fail につながる
@@ -553,7 +556,7 @@ static esp_err_t init_sdcard()
   
   // 3. 成功時の処理 (元のロジックをSD.hに置き換え)
   // 付近のロジックに相当
-  Serial.printf("SD.begin success\n"); // 成功ログを追加
+  Serial.printf("SD.begin success at %lu Hz\n", (unsigned long)SD_SPI_FREQUENCY); // 成功ログを追加
   uint8_t cardType = SD.cardType();
 
   // ... (カードタイプ表示のロジックはSDからSDに置き換える) ...
@@ -758,24 +761,47 @@ void listDir( const char * dirname, uint8_t levels) {
   }
 }
 
+bool deleteFolderOrFile(const char * val);
+
 void delete_old_stuff() {
 
-  Serial.printf("Total space: %lluMB\n",SD.totalBytes() / (1024 * 1024));
-  Serial.printf("Used space: %lluMB\n",SD.usedBytes() / (1024 * 1024));
+  uint64_t total_bytes = SD.totalBytes();
+  uint64_t used_bytes = SD.usedBytes();
+
+  Serial.printf("Total space: %lluMB\n", total_bytes / (1024 * 1024));
+  Serial.printf("Used space: %lluMB\n", used_bytes / (1024 * 1024));
+
+  if (total_bytes == 0 || used_bytes > total_bytes) {
+    Serial.println("Invalid SD capacity information. Cleanup stopped; check or reformat the SD card.");
+    return;
+  }
 
   //listDir( "/", 0);
 
-  float full = 1.0 *SD.usedBytes() /SD.totalBytes();;
+  float full = (float)used_bytes / (float)total_bytes;
   if (full  <  0.8) {
     Serial.printf("Nothing deleted, %.1f%% disk full\n", 100.0 * full);
   } else {
     Serial.printf("Disk is %.1f%% full ... deleting oldest file\n", 100.0 * full);
+    const uint16_t max_delete_attempts = 100;
+    uint16_t delete_attempts = 0;
     while (full > 0.8) {
 
+      if (delete_attempts >= max_delete_attempts) {
+        Serial.println("Cleanup reached its deletion limit. Check the SD card before recording more video.");
+        break;
+      }
+      delete_attempts++;
+
       double del_number = 999999999;
-      char del_numbername[50];
+      char del_numbername[50] = {0};
 
       File f =SD.open("/");
+      if (!f || !f.isDirectory()) {
+        Serial.println("Could not open the SD root directory. Cleanup stopped.");
+        if (f) f.close();
+        break;
+      }
 
       File file = f.openNextFile();
 
@@ -783,9 +809,9 @@ void delete_old_stuff() {
         //Serial.println(file.name());
         if (!file.isDirectory()) {
 
-          char foldname[50];
-          strcpy(foldname, file.name());
-          for ( int x = 0; x < 50; x++) {
+          char foldname[50] = {0};
+          snprintf(foldname, sizeof(foldname), "%s", file.name());
+          for ( int x = 0; x < 49 && foldname[x] != '\0'; x++) {
             if ( (foldname[x] >= 0x30 && foldname[x] <= 0x39) || foldname[x] == 0x2E) {
             } else {
               if (foldname[x] != 0) foldname[x] = 0x20;
@@ -794,67 +820,97 @@ void delete_old_stuff() {
 
           double i = atof(foldname);
           if ( i > 0 && i < del_number) {
-            strcpy (del_numbername, file.name());
+            snprintf(del_numbername, sizeof(del_numbername), "%s", file.name());
             del_number = i;
           }
           //Serial.printf("Name is %s, number is %f\n", foldname, i);
         }
+        file.close();
         file = f.openNextFile();
 
       }
-      Serial.printf("lowest is Name is %s, number is %f\n", del_numbername, del_number);
-      if (del_number < 999999999) {
-        deleteFolderOrFile(del_numbername);
-      }
-      full = 1.0 *SD.usedBytes() /SD.totalBytes();
-      Serial.printf("Disk is %.1f%% full ... \n", 100.0 * full);
       f.close();
+
+      if (del_number >= 999999999 || del_numbername[0] == '\0') {
+        Serial.println("No deletable file was found. Cleanup stopped to avoid an infinite loop.");
+        break;
+      }
+
+      Serial.printf("Lowest is Name is %s, number is %f\n", del_numbername, del_number);
+      uint64_t used_before_delete = used_bytes;
+      if (!deleteFolderOrFile(del_numbername)) {
+        Serial.println("Deletion failed. Cleanup stopped to avoid an infinite loop.");
+        break;
+      }
+      used_bytes = SD.usedBytes();
+
+      if (used_bytes > total_bytes || used_bytes >= used_before_delete) {
+        Serial.println("Deletion made no measurable progress. Cleanup stopped; check or reformat the SD card.");
+        break;
+      }
+
+      full = (float)used_bytes / (float)total_bytes;
+      Serial.printf("Disk is %.1f%% full ... \n", 100.0 * full);
     }
   }
 }
 
-void deleteFolderOrFile(const char * val) {
+bool deleteFolderOrFile(const char * val) {
   // Function provided by user @gemi254
   Serial.printf("Deleting : %s\n", val);
-  File f =SD.open("/" + String(val));
+  String target = String(val);
+  if (!target.startsWith("/")) target = "/" + target;
+
+  File f =SD.open(target);
   if (!f) {
     Serial.printf("Failed to open %s\n", val);
-    return;
+    return false;
   }
 
   if (f.isDirectory()) {
+    bool all_children_deleted = true;
     File file = f.openNextFile();
     while (file) {
+      String child_name = file.name();
       if (file.isDirectory()) {
         Serial.print("  DIR : ");
-        Serial.println(file.name());
+        Serial.println(child_name);
+        all_children_deleted = false;
+        file.close();
       } else {
         Serial.print("  FILE: ");
-        Serial.print(file.name());
+        Serial.print(child_name);
         Serial.print("  SIZE: ");
         Serial.print(file.size());
-        if (SD.remove(file.name())) {
+        file.close();
+        if (SD.remove(child_name)) {
           Serial.println(" deleted.");
         } else {
           Serial.println(" FAILED.");
+          all_children_deleted = false;
         }
       }
       file = f.openNextFile();
     }
     f.close();
     //Remove the dir
-    if (SD.rmdir("/" + String(val))) {
+    if (SD.rmdir(target)) {
       Serial.printf("Dir %s removed\n", val);
+      return all_children_deleted;
     } else {
       Serial.println("Remove dir failed");
+      return false;
     }
 
   } else {
     //Remove the file
-    if (SD.remove("/" + String(val))) {
+    f.close();
+    if (SD.remove(target)) {
       Serial.printf("File %s deleted\n", val);
+      return true;
     } else {
       Serial.println("Delete failed");
+      return false;
     }
   }
 }
@@ -1109,6 +1165,8 @@ static void start_avi() {
 
   logfile.flush();
   avifile.flush();
+  idxfile.flush();
+  last_avi_flush_time = millis();
 
 } // end of start avi
 
@@ -1216,7 +1274,11 @@ static void another_save_avi(camera_fb_t * fb ) {
   totalw = totalw + millis() - bw;
   time_in_sd += (millis() - start);
 
-  avifile.flush();
+  if ((uint32_t)(millis() - last_avi_flush_time) >= AVI_FLUSH_INTERVAL_MS) {
+    avifile.flush();
+    idxfile.flush();
+    last_avi_flush_time = millis();
+  }
 
 
 } // end of another_pic_avi
@@ -1237,6 +1299,8 @@ static void end_avi() {
 
   if (frame_cnt <  5 ) {
     Serial.println("Recording screwed up, less than 5 frames, forget index\n");
+    idxfile.flush();
+    avifile.flush();
     idxfile.close();
     avifile.close();
     int xx = remove("/idx.tmp");
@@ -1309,6 +1373,7 @@ static void end_avi() {
 
     avifile.seek( current_end , SeekSet);
 
+    idxfile.flush();
     idxfile.close();
 
     size_t i1_err = avifile.write(idx1_buf, 4);
@@ -1339,6 +1404,7 @@ static void end_avi() {
     free(AteBytes);
 
     idxfile.close();
+    avifile.flush();
     avifile.close();
 
     int xx =SD.remove("/idx.tmp");
@@ -2023,8 +2089,8 @@ static esp_err_t restart_handler(httpd_req_t *req) {
 //
 
 bool start_streaming = false;
-bool stream_82 = false;
-bool stream_81 = false;
+volatile bool stream_82 = false;
+volatile bool stream_81 = false;
 
 httpd_req_t *req_82;
 httpd_req_t *req_81;
@@ -2040,6 +2106,16 @@ int stream_81_frames ;
 long stream_81_start ;
 int stream_82_frames ;
 long stream_82_start ;
+
+void copy_frame_for_active_stream(camera_fb_t *frame) {
+  if ((!stream_81 && !stream_82) || frame == NULL) return;
+
+  xSemaphoreTake(baton, portMAX_DELAY);
+  framebuffer_len = frame->len;
+  memcpy(framebuffer, frame->buf, frame->len);
+  framebuffer_time = millis();
+  xSemaphoreGive(baton);
+}
 
 static esp_err_t stream_82_handler(httpd_req_t *req) {
 
@@ -2896,13 +2972,7 @@ void the_camera_loop (void* pvParameter) {
 
       wait_for_cam_start = millis();
       fb_next = get_good_jpeg();                    // should take nearly zero time due to time spent writing header
-      //if (framebuffer_time < (millis() - 10)){
-      xSemaphoreTake( baton, portMAX_DELAY );
-      framebuffer_len = fb_next->len;                    // v59.5
-      memcpy(framebuffer, fb_next->buf, fb_next->len);   // v59.5
-      framebuffer_time = millis();                       // v59.5
-      xSemaphoreGive( baton );
-      //}
+      copy_frame_for_active_stream(fb_next);
       wait_for_cam += millis() - wait_for_cam_start;
       xSemaphoreGive( sd_go );                     // trigger sd write to write first frame
 
@@ -3004,13 +3074,7 @@ void the_camera_loop (void* pvParameter) {
 
       long wait_for_cam_start = millis();
       fb_next = get_good_jpeg();               // should take near zero, unless the sd is faster than the camera, when we will have to wait for the camera
-      //if (framebuffer_time < (millis() - 10)){
-      xSemaphoreTake( baton, portMAX_DELAY );
-      framebuffer_len = fb_next->len;                    // v59.5
-      memcpy(framebuffer, fb_next->buf, fb_next->len);   // v59.5
-      framebuffer_time = millis();                       // v59.5
-      xSemaphoreGive( baton );
-      //}
+      copy_frame_for_active_stream(fb_next);
       wait_for_cam += millis() - wait_for_cam_start;
 
       //if (blinking) digitalWrite(21, frame_cnt % 2);
