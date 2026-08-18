@@ -142,6 +142,8 @@ int MagicNumber = 12;                // change this number to reset the eprom in
 int max_recordings = 0;           // 0 records continuously until stopped
 uint32_t completed_recordings = 0;
 const uint32_t AVI_FLUSH_INTERVAL_MS = 1000;
+const uint32_t SD_TASK_STACK_SIZE = 8192;
+const uint32_t SD_STACK_LOG_INTERVAL_WRITES = 100;
 uint32_t last_avi_flush_time = 0;
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -164,6 +166,7 @@ String configured_dns;
 TaskHandle_t the_camera_loop_task;
 TaskHandle_t the_sd_loop_task;
 TaskHandle_t the_streaming_loop_task;
+volatile uint32_t sd_task_min_free_stack_bytes = SD_TASK_STACK_SIZE;
 
 static SemaphoreHandle_t wait_for_sd;
 static SemaphoreHandle_t sd_go;
@@ -1575,6 +1578,11 @@ static void end_avi() {
   logfile.printf("web (core 0)    %10dms, %4.1f%%\n", time_in_web2  , 100.0 * time_in_web2   / time_total);
   logfile.printf("time total      %10dms, %4.1f%%\n", time_total    , 100.0 * time_total     / time_total);
 
+  Serial.printf("SD task minimum free stack since startup: %u / %u bytes\n",
+                sd_task_min_free_stack_bytes, SD_TASK_STACK_SIZE);
+  logfile.printf("SD task minimum free stack since startup: %u / %u bytes\n",
+                 sd_task_min_free_stack_bytes, SD_TASK_STACK_SIZE);
+
   logfile.flush();
 
 }
@@ -2752,6 +2760,11 @@ void setup() {
   Serial.println("                                    ");
   Serial.println("-------------------------------------");
   Serial.printf("ESP32-CAM-Video-Recorder-junior %s\n", vernum);
+  #ifdef ESP_ARDUINO_VERSION_STR
+  Serial.printf("ESP32 Arduino core: %s\n", ESP_ARDUINO_VERSION_STR);
+  #else
+  Serial.println("ESP32 Arduino core: unknown");
+  #endif
   Serial.println("-------------------------------------");
 
   Serial.print("setup, core ");  Serial.print(xPortGetCoreID());
@@ -2835,6 +2848,12 @@ void setup() {
 
   if (!logfile) {
     Serial.println("Failed to open logfile for writing");
+  } else {
+    #ifdef ESP_ARDUINO_VERSION_STR
+    logfile.printf("ESP32 Arduino core: %s\n", ESP_ARDUINO_VERSION_STR);
+    #else
+    logfile.println("ESP32 Arduino core: unknown");
+    #endif
   }
   Serial.println("Setting up the camera ...");
   config_camera();
@@ -2857,7 +2876,17 @@ void setup() {
   delay(100);
 
   // prio 4 - higher than the cam_loop(), and the streaming
-  xTaskCreatePinnedToCore( the_sd_loop, "the_sd_loop", 2000, NULL, 4, &the_sd_loop_task, 1);  // prio 4, core 1
+  BaseType_t sd_task_create_result = xTaskCreatePinnedToCore(
+    the_sd_loop, "the_sd_loop", SD_TASK_STACK_SIZE, NULL, 4, &the_sd_loop_task, 1);  // prio 4, core 1
+
+  if (sd_task_create_result != pdPASS || the_sd_loop_task == NULL) {
+    Serial.printf("Failed to create the_sd_loop task (result %d)\n", (int)sd_task_create_result);
+    if (logfile) {
+      logfile.printf("Failed to create the_sd_loop task (result %d)\n", (int)sd_task_create_result);
+      logfile.flush();
+    }
+    major_fail();
+  }
 
   delay(200);
 
@@ -2910,10 +2939,32 @@ void the_sd_loop (void* pvParameter) {
 
   Serial.print("the_sd_loop, core ");  Serial.print(xPortGetCoreID());
   Serial.print(", priority = "); Serial.println(uxTaskPriorityGet(NULL));
+  sd_task_min_free_stack_bytes = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+  Serial.printf("SD task stack: %u bytes; minimum free at startup: %u bytes\n",
+                SD_TASK_STACK_SIZE, sd_task_min_free_stack_bytes);
+  if (logfile) {
+    logfile.printf("SD task stack: %u bytes; minimum free at startup: %u bytes\n",
+                   SD_TASK_STACK_SIZE, sd_task_min_free_stack_bytes);
+  }
+
+  uint32_t completed_sd_writes = 0;
 
   while (1) {
     xSemaphoreTake( sd_go, portMAX_DELAY );            // we wait for camera loop to tell us to go
     another_save_avi( fb_curr);                        // do the actual sd wrte
+    completed_sd_writes++;
+    sd_task_min_free_stack_bytes = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+
+    if (completed_sd_writes == 1 ||
+        completed_sd_writes % SD_STACK_LOG_INTERVAL_WRITES == 0) {
+      Serial.printf("SD task minimum free stack after %u writes: %u / %u bytes\n",
+                    completed_sd_writes, sd_task_min_free_stack_bytes, SD_TASK_STACK_SIZE);
+      if (logfile) {
+        logfile.printf("SD task minimum free stack after %u writes: %u / %u bytes\n",
+                       completed_sd_writes, sd_task_min_free_stack_bytes, SD_TASK_STACK_SIZE);
+      }
+    }
+
     xSemaphoreGive( wait_for_sd );                     // tell camera loop we are done
   }
 }
