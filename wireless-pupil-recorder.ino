@@ -124,9 +124,14 @@ String TIMEZONE = "GMT0BST,M3.5.0/01,M10.5.0/02";
 #define Lots_of_Stats 1
 #define blinking 0
 
-int framesize = FRAMESIZE_HD;
+const int DEFAULT_FRAME_SIZE_INDEX = 11;        // Stable config index: HD 1280x720
+const int DEFAULT_FRAME_BUFFER_SIZE_INDEX = 13; // Stable config index: UXGA 1600x1200
+const int MIN_FRAME_SIZE_INDEX = 0;
+const int MAX_FRAME_SIZE_INDEX = 21;
+
+int framesize = DEFAULT_FRAME_SIZE_INDEX;
 int quality = 12;
-int framesizeconfig = FRAMESIZE_UXGA;
+int framesizeconfig = DEFAULT_FRAME_BUFFER_SIZE_INDEX;
 int qualityconfig = 5;
 int buffersconfig = 3;
 int avi_length = 1800;            // how long a movie in seconds -- 1800 sec = 30 min
@@ -314,41 +319,40 @@ uint8_t avi1_buf[4] = {0x41, 0x56, 0x49, 0x31};    // "AVI1"
 uint8_t idx1_buf[4] = {0x69, 0x64, 0x78, 0x31};    // "idx1"
 
 
-struct frameSizeStruct {
-  uint8_t frameWidth[2];
-  uint8_t frameHeight[2];
-};
+// config.txt uses the recorder's original, stable 0-21 frame-size indexes.
+// Do not cast those indexes directly to framesize_t: esp32-camera has added enum
+// members over time, which changes the numeric values of later FRAMESIZE_* items.
+static bool is_valid_frame_size_index(int index) {
+  return index >= MIN_FRAME_SIZE_INDEX && index <= MAX_FRAME_SIZE_INDEX;
+}
 
-//  data structure from here https://github.com/s60sc/ESP32-CAM_MJPEG2SD/blob/master/avi.cpp, extended for ov5640
-
-static const frameSizeStruct frameSizeData[] = {
-  {{0x60, 0x00}, {0x60, 0x00}}, // FRAMESIZE_96X96,    // 96x96
-  {{0xA0, 0x00}, {0x78, 0x00}}, // FRAMESIZE_QQVGA,    // 160x120
-  {{0xB0, 0x00}, {0x90, 0x00}}, // FRAMESIZE_QCIF,     // 176x144
-  {{0xF0, 0x00}, {0xB0, 0x00}}, // FRAMESIZE_HQVGA,    // 240x176
-  {{0xF0, 0x00}, {0xF0, 0x00}}, // FRAMESIZE_240X240,  // 240x240
-  {{0x40, 0x01}, {0xF0, 0x00}}, // FRAMESIZE_QVGA,     // 320x240   framessize
-  {{0x90, 0x01}, {0x28, 0x01}}, // FRAMESIZE_CIF,      // 400x296       bytes per buffer required in psram - quality must be higher number (lower quality) than config quality
-  {{0xE0, 0x01}, {0x40, 0x01}}, // FRAMESIZE_HVGA,     // 480x320       low qual  med qual  high quality
-  {{0x80, 0x02}, {0xE0, 0x01}}, // FRAMESIZE_VGA,      // 640x480   8   11+   ##  6-10  ##  0-5         indoor(56,COUNT=3)  (56,COUNT=2)          (56,count=1)
-  //               38,400    61,440    153,600
-  {{0x20, 0x03}, {0x58, 0x02}}, // FRAMESIZE_SVGA,     // 800x600   9                       240,000
-  {{0x00, 0x04}, {0x00, 0x03}}, // FRAMESIZE_XGA,      // 1024x768  10
-  {{0x00, 0x05}, {0xD0, 0x02}}, // FRAMESIZE_HD,       // 1280x720  11  115,200   184,320   460,800     (11)50.000  25.4fps   (11)50.000 12fps    (11)50,000  12.7fps
-  {{0x00, 0x05}, {0x00, 0x04}}, // FRAMESIZE_SXGA,     // 1280x1024 12
-  {{0x40, 0x06}, {0xB0, 0x04}}, // FRAMESIZE_UXGA,     // 1600x1200 13  240,000   384,000   960,000
-  // 3MP Sensors
-  {{0x80, 0x07}, {0x38, 0x04}}, // FRAMESIZE_FHD,      // 1920x1080 14  259,200   414,720   1,036,800   (11)210,000 5.91fps
-  {{0xD0, 0x02}, {0x00, 0x05}}, // FRAMESIZE_P_HD,     //  720x1280 15
-  {{0x60, 0x03}, {0x00, 0x06}}, // FRAMESIZE_P_3MP,    //  864x1536 16
-  {{0x00, 0x08}, {0x00, 0x06}}, // FRAMESIZE_QXGA,     // 2048x1536 17  393,216   629,146   1,572,864
-  // 5MP Sensors
-  {{0x00, 0x0A}, {0xA0, 0x05}}, // FRAMESIZE_QHD,      // 2560x1440 18  460,800   737,280   1,843,200   (11)400,000 3.5fps    (11)330,000 1.95fps
-  {{0x00, 0x0A}, {0x40, 0x06}}, // FRAMESIZE_WQXGA,    // 2560x1600 19
-  {{0x38, 0x04}, {0x80, 0x07}}, // FRAMESIZE_P_FHD,    // 1080x1920 20
-  {{0x00, 0x0A}, {0x80, 0x07}}  // FRAMESIZE_QSXGA,    // 2560x1920 21  614,400   983,040   2,457,600   (15)425,000 3.25fps   (15)382,000 1.7fps  (15)385,000 1.7fps
-
-};
+static framesize_t driver_frame_size_from_index(int index) {
+  switch (index) {
+    case 0:  return FRAMESIZE_96X96;
+    case 1:  return FRAMESIZE_QQVGA;
+    case 2:  return FRAMESIZE_QCIF;
+    case 3:  return FRAMESIZE_HQVGA;
+    case 4:  return FRAMESIZE_240X240;
+    case 5:  return FRAMESIZE_QVGA;
+    case 6:  return FRAMESIZE_CIF;
+    case 7:  return FRAMESIZE_HVGA;
+    case 8:  return FRAMESIZE_VGA;
+    case 9:  return FRAMESIZE_SVGA;
+    case 10: return FRAMESIZE_XGA;
+    case 11: return FRAMESIZE_HD;
+    case 12: return FRAMESIZE_SXGA;
+    case 13: return FRAMESIZE_UXGA;
+    case 14: return FRAMESIZE_FHD;
+    case 15: return FRAMESIZE_P_HD;
+    case 16: return FRAMESIZE_P_3MP;
+    case 17: return FRAMESIZE_QXGA;
+    case 18: return FRAMESIZE_QHD;
+    case 19: return FRAMESIZE_WQXGA;
+    case 20: return FRAMESIZE_P_FHD;
+    case 21: return FRAMESIZE_QSXGA;
+    default: return FRAMESIZE_HD;
+  }
+}
 
 const int avi_header[AVIOFFSET] PROGMEM = {
   0x52, 0x49, 0x46, 0x46, 0xD8, 0x01, 0x0E, 0x00, 0x41, 0x56, 0x49, 0x20, 0x4C, 0x49, 0x53, 0x54,
@@ -380,6 +384,13 @@ static void inline print_quartet(unsigned long i, File fd) {
   y[2] = (i >> 16) % 0x100;
   y[3] = (i >> 24) % 0x100;
   size_t i1_err = fd.write(y , 4);
+}
+
+static void inline write_quartet_to_buffer(uint8_t *destination, uint32_t value) {
+  destination[0] = value & 0xFF;
+  destination[1] = (value >> 8) & 0xFF;
+  destination[2] = (value >> 16) & 0xFF;
+  destination[3] = (value >> 24) & 0xFF;
 }
 
 //
@@ -460,8 +471,11 @@ static void config_camera() {
 
   config.pixel_format = PIXFORMAT_JPEG;
 
-  Serial.printf("Frame config %d, quality config %d, buffers config %d\n", framesizeconfig, qualityconfig, buffersconfig);
-  config.frame_size =  (framesize_t)framesizeconfig;
+  framesize_t initial_driver_frame_size = driver_frame_size_from_index(framesizeconfig);
+  framesize_t recording_driver_frame_size = driver_frame_size_from_index(framesize);
+  Serial.printf("Frame config index %d -> driver enum %d, quality config %d, buffers config %d\n",
+                framesizeconfig, (int)initial_driver_frame_size, qualityconfig, buffersconfig);
+  config.frame_size = initial_driver_frame_size;
   config.jpeg_quality = qualityconfig;
   config.fb_count = buffersconfig;
 
@@ -511,7 +525,13 @@ static void config_camera() {
   }
 
   ss->set_quality(ss, quality);
-  ss->set_framesize(ss, (framesize_t)framesize);
+  if (ss->set_framesize(ss, recording_driver_frame_size) != 0) {
+    Serial.printf("Failed to set recording frame-size index %d (driver enum %d)\n",
+                  framesize, (int)recording_driver_frame_size);
+    major_fail();
+  }
+  Serial.printf("Recording frame-size index %d -> driver enum %d\n",
+                framesize, (int)recording_driver_frame_size);
 
   ss->set_brightness(ss, 1);  //up the blightness just a bit
   ss->set_saturation(ss, -2); //lower the saturation
@@ -523,7 +543,8 @@ static void config_camera() {
       Serial.println("Camera Capture Failed");
     } else {
       Serial.print("Pic, len="); Serial.print(fb->len);
-      Serial.printf(", new fb %X\n", (long)fb->buf);
+      Serial.printf(", size=%ux%u, new fb %X\n",
+                    (unsigned int)fb->width, (unsigned int)fb->height, (long)fb->buf);
       esp_camera_fb_return(fb);
       delay(10);
     }
@@ -664,9 +685,9 @@ void read_config_file() {
   */
 
   String cname = "desklens";
-  int cframesize = 11;
+  int cframesize = DEFAULT_FRAME_SIZE_INDEX;
   int cquality = 12;
-  int cframesizeconfig = 13;
+  int cframesizeconfig = DEFAULT_FRAME_BUFFER_SIZE_INDEX;
   int cqualityconfig = 5;
   int cbuffersconfig = 4; //58.9
   int clength = 1800;
@@ -766,6 +787,16 @@ void read_config_file() {
   }
 
   if (crecordingcount < 0) crecordingcount = 0;
+  if (!is_valid_frame_size_index(cframesize)) {
+    Serial.printf("Invalid frame-size index %d; using %d (HD 1280x720)\n",
+                  cframesize, DEFAULT_FRAME_SIZE_INDEX);
+    cframesize = DEFAULT_FRAME_SIZE_INDEX;
+  }
+  if (!is_valid_frame_size_index(cframesizeconfig)) {
+    Serial.printf("Invalid frame-buffer size index %d; using %d (UXGA 1600x1200)\n",
+                  cframesizeconfig, DEFAULT_FRAME_BUFFER_SIZE_INDEX);
+    cframesizeconfig = DEFAULT_FRAME_BUFFER_SIZE_INDEX;
+  }
   if (cwifiipmode != 0 && cwifiipmode != 1) {
     Serial.println("Invalid STA IP mode; using DHCP/mDNS");
     cwifiipmode = 0;
@@ -1163,7 +1194,7 @@ void do_eprom_write() {
 //
 // Make the avi functions
 //
-//   start_avi() - open the file and write headers
+//   start_avi() - open the file and write headers using the first captured frame
 //   another_pic_avi() - write one more frame of movie
 //   end_avi() - write the final parameters and close the file
 
@@ -1173,9 +1204,18 @@ void do_eprom_write() {
 // start_avi - open the files and write in headers
 //
 
-static void start_avi() {
+static void start_avi(const camera_fb_t *first_frame) {
 
   long start = millis();
+
+  if (first_frame == NULL || first_frame->width == 0 || first_frame->height == 0) {
+    Serial.println("Cannot start AVI: first camera frame has no valid dimensions");
+    major_fail();
+    return;
+  }
+
+  uint32_t avi_width = first_frame->width;
+  uint32_t avi_height = first_frame->height;
 
   Serial.println("Starting an avi ");
 
@@ -1206,10 +1246,17 @@ static void start_avi() {
     buf[i] = ch;
   }
 
-  memcpy(buf + 0x40, frameSizeData[framesize].frameWidth, 2);
-  memcpy(buf + 0xA8, frameSizeData[framesize].frameWidth, 2);
-  memcpy(buf + 0x44, frameSizeData[framesize].frameHeight, 2);
-  memcpy(buf + 0xAC, frameSizeData[framesize].frameHeight, 2);
+  // Use the dimensions reported by the camera frame itself. This keeps the
+  // MJPEG payload and AVI headers consistent across esp32-camera versions.
+  write_quartet_to_buffer(buf + 0x40, avi_width);
+  write_quartet_to_buffer(buf + 0xA8, avi_width);
+  write_quartet_to_buffer(buf + 0x44, avi_height);
+  write_quartet_to_buffer(buf + 0xAC, avi_height);
+
+  Serial.printf("AVI dimensions %ux%u from first captured frame\n",
+                (unsigned int)avi_width, (unsigned int)avi_height);
+  logfile.printf("AVI dimensions %ux%u from first captured frame\n",
+                 (unsigned int)avi_width, (unsigned int)avi_height);
 
   size_t err = avifile.write(buf, AVIOFFSET);
 
@@ -3067,7 +3114,7 @@ void the_camera_loop (void* pvParameter) {
       fb_curr = get_good_jpeg();                     // should take zero time
       wait_for_cam += millis() - wait_for_cam_start;
 
-      start_avi();
+      start_avi(fb_curr);
 
       wait_for_cam_start = millis();
       fb_next = get_good_jpeg();                    // should take nearly zero time due to time spent writing header

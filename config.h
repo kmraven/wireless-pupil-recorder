@@ -3,7 +3,7 @@
 // Written to /config.txt when the SD card does not already contain one.
 // Keep this template in sync with config.example.txt and README.md.
 const char config_txt[] PROGMEM = R"CONFIG(desklens  // camera name and mDNS host: http://desklens.local/
-11  // frame size: 11=HD (1280x720)
+11  // stable recorder frame-size index: 11=HD (1280x720)
 1800  // recording length in seconds
 0  // recording count; 0=unlimited
 0  // recording frame interval in ms; 0=fastest
