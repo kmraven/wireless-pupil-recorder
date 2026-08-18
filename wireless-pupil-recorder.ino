@@ -101,6 +101,10 @@ Global variables use 59164 bytes (18%) of dynamic memory, leaving 268516 bytes f
 #include "esp_http_server.h"
 #include "esp_camera.h"
 #include "sensor.h"
+#include "WiFi.h"
+#include "esp_wifi.h"
+#include <errno.h>
+#include <string.h>
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 // user edits here:
@@ -152,6 +156,7 @@ bool configfile = false;
 bool InternetOff = true;
 bool reboot_now = false;
 bool restart_now = false;
+bool wifi_suppressed_after_brownout = false;
 volatile bool safe_stop_requested = false;
 volatile bool recording_closed_for_shutdown = false;
 volatile bool safe_stop_complete = false;
@@ -165,7 +170,6 @@ String configured_dns;
 
 TaskHandle_t the_camera_loop_task;
 TaskHandle_t the_sd_loop_task;
-TaskHandle_t the_streaming_loop_task;
 volatile uint32_t sd_task_min_free_stack_bytes = SD_TASK_STACK_SIZE;
 
 static SemaphoreHandle_t wait_for_sd;
@@ -208,8 +212,6 @@ camera_fb_t * fb_next = NULL;
 #include "esp_system.h"
 #include "nvs_flash.h"
 #include "nvs.h"
-#include "soc/soc.h"
-#include "soc/rtc_cntl_reg.h"
 
 static esp_err_t cam_err;
 float most_recent_fps = 0;
@@ -219,11 +221,11 @@ uint8_t* framebuffer;
 uint8_t* framebuffer2;
 uint8_t* framebuffer3;
 
+const size_t WEB_FRAMEBUFFER_CAPACITY = 512 * 1024;
+
 int framebuffer_len;
-int framebuffer2_len;
 int framebuffer3_len;
 long framebuffer_time = 0;
-long framebuffer2_time = 0;
 long framebuffer3_time = 0;
 
 int first = 1;
@@ -1165,6 +1167,7 @@ void do_eprom_read() {
 
   EEPROM.begin(200);
   EEPROM.get(0, ed);
+  EEPROM.end();
 
   if (ed.eprom_good == MagicNumber) {
     Serial.println("Good settings in the EPROM ");
@@ -1175,7 +1178,6 @@ void do_eprom_read() {
     Serial.println("No settings in EPROM - Starting with File Group 1 ");
     file_group = 1;
   }
-  do_eprom_write();
   file_number = 1;
 }
 
@@ -1608,7 +1610,6 @@ static void end_avi() {
   } HTTPMethod;
 */
 //#include "C:\ArduinoPortable\arduino-1.8.19\portable\packages\esp32\hardware\esp32\2.0.3\libraries\WiFi\src\WiFi.h"
-#include "WiFi.h"
 //#include "C:\ArduinoPortable\sketch\libraries\WiFiManager\WiFiManager.h"
 //#include "WiFiManager.h"
 #include "ESPmDNS.h"
@@ -1622,32 +1623,178 @@ time_t now;
 struct tm timeinfo;
 char localip[20];
 WiFiEventId_t eventID;
-#include "esp_wifi.h"
+
+const wifi_power_t WIFI_TX_POWER_INITIAL = WIFI_POWER_13dBm;
+const wifi_power_t WIFI_TX_POWER_FALLBACK = WIFI_POWER_15dBm;
+const uint32_t WIFI_STA_CONNECT_TIMEOUT_MS = 16000;
+const uint32_t WIFI_POWER_STAGE_DELAY_MS = 500;
+const uint32_t WIFI_INTERFACE_START_TIMEOUT_MS = 1000;
+volatile bool wifi_disconnect_reason_available = false;
+volatile uint8_t last_wifi_disconnect_reason = WIFI_REASON_UNSPECIFIED;
+bool wifi_event_handler_registered = false;
+
+void register_wifi_diagnostics() {
+  if (wifi_event_handler_registered) return;
+
+  eventID = WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    uint8_t reason = info.wifi_sta_disconnected.reason;
+    last_wifi_disconnect_reason = reason;
+    wifi_disconnect_reason_available = true;
+    Serial.printf("\nWiFi disconnected: reason=%u (%s), status=%d\n",
+                  reason,
+                  WiFi.disconnectReasonName((wifi_err_reason_t)reason),
+                  WiFi.status());
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+
+  wifi_event_handler_registered = eventID != 0;
+  if (!wifi_event_handler_registered) {
+    Serial.println("WARNING: Failed to register WiFi disconnect diagnostics");
+  }
+}
+
+bool wait_for_wifi_interface_start(bool station_mode) {
+  uint32_t started_at = millis();
+  while ((station_mode ? !WiFi.STA.started() : !WiFi.AP.started()) &&
+         (uint32_t)(millis() - started_at) < WIFI_INTERFACE_START_TIMEOUT_MS) {
+    delay(10);
+  }
+  return station_mode ? WiFi.STA.started() : WiFi.AP.started();
+}
+
+void report_sta_connection_failure() {
+  int status = WiFi.status();
+  if (wifi_disconnect_reason_available) {
+    uint8_t reason = last_wifi_disconnect_reason;
+    const char *reason_name = WiFi.disconnectReasonName((wifi_err_reason_t)reason);
+    Serial.printf("STA connection failed: status=%d, reason=%u (%s); AP fallback is disabled\n",
+                  status, reason, reason_name);
+    if (logfile) {
+      logfile.printf("STA connection failed: status=%d, reason=%u (%s)\n",
+                     status, reason, reason_name);
+    }
+  } else {
+    Serial.printf("STA connection failed: status=%d, no disconnect reason was reported; AP fallback is disabled\n",
+                  status);
+    if (logfile) {
+      logfile.printf("STA connection failed: status=%d, no disconnect reason was reported\n",
+                     status);
+    }
+  }
+}
+
+void stop_wifi_completely() {
+  MDNS.end();
+  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_OFF);
+  InternetOff = true;
+}
+
+bool set_wifi_tx_power(wifi_power_t power, const char *label) {
+  if (WiFi.setTxPower(power)) {
+    Serial.printf("WiFi TX power set to %s\n", label);
+    return true;
+  }
+
+  Serial.printf("WARNING: Failed to set WiFi TX power to %s\n", label);
+  return false;
+}
+
+bool set_sta_power_save(wifi_ps_type_t mode, const char *description) {
+  if (wifi_mode != RECORDER_WIFI_STA || WiFi.status() != WL_CONNECTED) return true;
+
+  if (WiFi.setSleep(mode)) {
+    Serial.println(description);
+    return true;
+  }
+
+  Serial.printf("WARNING: Failed to change WiFi power save mode (%s)\n", description);
+  return false;
+}
+
+bool wait_for_sta_connection() {
+  uint32_t started_at = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         (uint32_t)(millis() - started_at) < WIFI_STA_CONNECT_TIMEOUT_MS) {
+    delay(1000);
+    Serial.print(".");
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
+bool connect_sta_at_power(wifi_power_t power, const char *label) {
+  set_wifi_tx_power(power, label);
+  wifi_disconnect_reason_available = false;
+  last_wifi_disconnect_reason = WIFI_REASON_UNSPECIFIED;
+
+  wl_status_t begin_status = WiFi.begin(cssid.c_str(), cpass.c_str());
+  Serial.printf("WiFi.begin initial status at %s: %d\n", label, begin_status);
+
+  if (wait_for_sta_connection()) {
+    Serial.printf("\nSTA connected at %s; RSSI %ld dBm, channel %ld\n",
+                  label, (long)WiFi.RSSI(), (long)WiFi.channel());
+    return true;
+  }
+
+  Serial.println();
+  report_sta_connection_failure();
+  return false;
+}
+
+void apply_idle_sta_power_save() {
+  if (!set_sta_power_save(WIFI_PS_MIN_MODEM,
+                          "WiFi minimum modem sleep enabled while live stream is idle")) {
+    Serial.println("WiFi will remain active without modem sleep");
+  }
+}
+
+void apply_streaming_sta_power() {
+  if (!set_sta_power_save(WIFI_PS_NONE,
+                          "WiFi modem sleep disabled for live stream")) {
+    Serial.println("Live stream will continue with the current WiFi power-save setting");
+  }
+}
+
+void apply_initial_ap_power() {
+  if (!set_wifi_tx_power(WIFI_TX_POWER_INITIAL, "13 dBm")) {
+    Serial.println("AP will continue with the current WiFi TX power");
+  }
+}
+
+void restore_idle_sta_power_save() {
+  if (wifi_mode == RECORDER_WIFI_STA && WiFi.status() == WL_CONNECTED) {
+    if (WiFi.setSleep(WIFI_PS_MIN_MODEM)) {
+      Serial.println("WiFi minimum modem sleep restored after live stream");
+    } else {
+      Serial.println("WARNING: Failed to restore WiFi minimum modem sleep");
+    }
+  }
+}
 
 bool init_wifi() {
-  int connAttempts = 0;
-  uint32_t brown_reg_temp = READ_PERI_REG(RTC_CNTL_BROWN_OUT_REG);
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-  auto finish_wifi_init = [brown_reg_temp](bool success) {
-    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, brown_reg_temp);
-    return success;
-  };
-
   if (wifi_mode == RECORDER_WIFI_OFF) {
-    WiFi.mode(WIFI_OFF);
-    InternetOff = true;
-    return finish_wifi_init(false);
+    stop_wifi_completely();
+    return false;
   }
 
   if (wifi_mode == RECORDER_WIFI_STA) {
     if (cssid.length() == 0 || cssid.length() > 32 || cpass.length() > 64) {
       Serial.println("Invalid STA SSID or password length");
-      return finish_wifi_init(false);
+      stop_wifi_completely();
+      return false;
     }
 
     WiFi.disconnect(true, false);
     WiFi.setHostname(devname);
-    WiFi.mode(WIFI_STA);
+    register_wifi_diagnostics();
+    if (!WiFi.mode(WIFI_STA) || !wait_for_wifi_interface_start(true)) {
+      Serial.println("Failed to start the WiFi STA interface");
+      stop_wifi_completely();
+      return false;
+    }
+
+    // Keep the radio awake while authenticating. Idle modem sleep is enabled
+    // only after the STA has connected successfully.
+    WiFi.setSleep(WIFI_PS_NONE);
 
     if (wifi_ip_mode == 1) {
       IPAddress static_ip;
@@ -1657,32 +1804,32 @@ bool init_wifi() {
       if (!static_ip.fromString(cstaticip) || !gateway.fromString(cgateway) ||
           !subnet.fromString(csubnet) || !dns.fromString(configured_dns)) {
         Serial.println("Invalid static IPv4 configuration");
-        WiFi.mode(WIFI_OFF);
-        return finish_wifi_init(false);
+        stop_wifi_completely();
+        return false;
       }
       if (!WiFi.config(static_ip, gateway, subnet, dns)) {
         Serial.println("Failed to apply static IPv4 configuration");
-        WiFi.mode(WIFI_OFF);
-        return finish_wifi_init(false);
+        stop_wifi_completely();
+        return false;
       }
     }
 
     Serial.printf("Connecting to STA SSID >%s<\n", cssid.c_str());
-    WiFi.begin(cssid.c_str(), cpass.c_str());
+    bool connected = connect_sta_at_power(WIFI_TX_POWER_INITIAL, "13 dBm");
 
-    while (WiFi.status() != WL_CONNECTED ) {
-      delay(1000);
-      Serial.print(".");
-      if (connAttempts++ == 15) break;
+    if (!connected) {
+      Serial.println("Retrying STA connection with 15 dBm TX power");
+      WiFi.disconnect(false, false);
+      delay(WIFI_POWER_STAGE_DELAY_MS);
+      connected = connect_sta_at_power(WIFI_TX_POWER_FALLBACK, "15 dBm");
     }
 
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("\nSTA connection failed; AP fallback is disabled");
-      WiFi.disconnect(true, false);
-      WiFi.mode(WIFI_OFF);
-      InternetOff = true;
-      return finish_wifi_init(false);
+    if (!connected) {
+      stop_wifi_completely();
+      return false;
     }
+
+    apply_idle_sta_power_save();
 
     configTime(0, 0, "pool.ntp.org");
     char tzchar[60];
@@ -1705,24 +1852,23 @@ bool init_wifi() {
     sprintf(localip, "%s", WiFi.localIP().toString().c_str());
     Serial.print("IP: "); Serial.println(localip); Serial.println(" ");
     InternetOff = false;
-
-    eventID = WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
-      //  info.disconnected.reason ==>  info.wifi_sta_disconnected.reason - update with esp32_arduino 2.00 v58
-      if (info.wifi_sta_disconnected.reason != 201) {
-        Serial.printf( "\nframe_cnt: %8d, WiFi event Reason: %d , Status: %d\n", frame_cnt, info.wifi_sta_disconnected.reason, WiFi.status());
-        logfile.printf("\nframe_cnt: %8d, WiFi event Reason: %d , Status: %d\n", frame_cnt, info.wifi_sta_disconnected.reason, WiFi.status());
-      }
-    });
   } else if (wifi_mode == RECORDER_WIFI_AP) {
     if (cssid.length() == 0 || cssid.length() > 32 ||
         cpass.length() < 8 || cpass.length() > 63) {
       Serial.println("AP SSID must be 1-32 characters and password 8-63 characters");
-      return finish_wifi_init(false);
+      stop_wifi_completely();
+      return false;
     }
 
     Serial.printf("Setting AP with SSID >%s<\n", cssid.c_str());
+    WiFi.disconnect(true, false);
     WiFi.setHostname(devname);
-    WiFi.mode(WIFI_MODE_AP);
+    if (!WiFi.mode(WIFI_MODE_AP) || !wait_for_wifi_interface_start(false)) {
+      Serial.println("Failed to start the WiFi AP interface");
+      stop_wifi_completely();
+      return false;
+    }
+    apply_initial_ap_power();
 
     IPAddress ap_ip(192, 168, 4, 1);
     IPAddress ap_gateway(192, 168, 4, 1);
@@ -1730,9 +1876,8 @@ bool init_wifi() {
     if (!WiFi.softAPConfig(ap_ip, ap_gateway, ap_subnet) ||
         !WiFi.softAP(cssid.c_str(), cpass.c_str())) {
       Serial.println("Failed to start AP");
-      WiFi.mode(WIFI_OFF);
-      InternetOff = true;
-      return finish_wifi_init(false);
+      stop_wifi_completely();
+      return false;
     }
 
     IPAddress IP = WiFi.softAPIP();
@@ -1751,24 +1896,43 @@ bool init_wifi() {
     Serial.printf("mDNS responder started: http://%s.local/\n", devname);
   }
 
-  //typedef enum {
-  //    WIFI_PS_NONE,        /**< No power save */
-  //    WIFI_PS_MIN_MODEM,   /**< Minimum modem power saving. In this mode, station wakes up to receive beacon every DTIM period */
-  //    WIFI_PS_MAX_MODEM,   /**< Maximum modem power saving. In this mode, interval to receive beacons is determined by the listen_interval
-  //                              parameter in wifi_sta_config_t.
-  //                              Attention: Using this option may cause ping failures. Not recommended */
-  //} wifi_ps_type_t;
+  if (wifi_mode == RECORDER_WIFI_STA) {
+    wifi_ps_type_t power_save_type;
+    if (esp_wifi_get_ps(&power_save_type) == ESP_OK) {
+      Serial.printf("WiFi power save mode: %d (1 = minimum modem sleep)\n", power_save_type);
+    }
+  }
 
-  wifi_ps_type_t the_type;
+  return true;
+}
 
-  esp_wifi_get_ps(&the_type);
-  //Serial.printf("The power save was: %d\n", the_type);
-  //Serial.printf("Set power save to %d\n", WIFI_PS_NONE);
-  esp_wifi_set_ps(WIFI_PS_NONE);
-  esp_wifi_get_ps(&the_type);
-  Serial.printf("The power save is : %d\n", the_type);
+bool init_wifi_with_power_staging() {
+  uint32_t previous_cpu_mhz = getCpuFrequencyMhz();
+  bool cpu_frequency_reduced = false;
 
-  return finish_wifi_init(true);
+  if (previous_cpu_mhz > 80) {
+    cpu_frequency_reduced = setCpuFrequencyMhz(80);
+    if (cpu_frequency_reduced) {
+      Serial.printf("CPU frequency temporarily reduced: %u -> 80 MHz\n", previous_cpu_mhz);
+    } else {
+      Serial.println("WARNING: Failed to reduce CPU frequency for WiFi startup");
+    }
+  }
+
+  delay(WIFI_POWER_STAGE_DELAY_MS);
+  bool success = init_wifi();
+  delay(WIFI_POWER_STAGE_DELAY_MS);
+
+  if (cpu_frequency_reduced) {
+    if (setCpuFrequencyMhz(previous_cpu_mhz)) {
+      Serial.printf("CPU frequency restored to %u MHz\n", previous_cpu_mhz);
+    } else {
+      Serial.printf("WARNING: Failed to restore CPU frequency to %u MHz\n", previous_cpu_mhz);
+    }
+  }
+
+  delay(WIFI_POWER_STAGE_DELAY_MS);
+  return success;
 }
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1777,7 +1941,7 @@ bool init_wifi() {
 #include <HTTPClient.h>
 
 httpd_handle_t camera_httpd = NULL;
-httpd_handle_t stream_httpd = NULL;
+httpd_handle_t stream_httpd_81 = NULL;
 
 char the_page[4200];
 
@@ -1809,10 +1973,8 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     xSemaphoreGive( baton );
     fb = esp_camera_fb_get(); //get_good_jpeg();
     //Serial.println("capp take");
-    //Serial.printf("millis %d, fb1 %d, fb2 %d\n", millis(), framebuffer_time, framebuffer2_time);
     if (!fb) {
       Serial.println("Photos - Camera Capture Failed");
-      //start_streaming = false;
     } else {
       xSemaphoreTake( baton, portMAX_DELAY );
       framebuffer3_len = fb->len;
@@ -1873,8 +2035,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
 
  <h3><a href="http://%s/">http://%s/</a></h3>
  <h3>Streaming</h3>
- <a href="http://%s:81/stream"><button>Stream 81</button></a>
- <a href="http://%s:82/stream"><button>Stream 82</button></a>
+ <a href="http://%s:81/stream"><button>Live stream</button></a>
  <h3>Series of pictures</h3>
  <a href="http://%s/photos"><button>10 x 3 sec</button> </a>
  <a href="http://%s/fphotos"><button>10 x 1 sec</button></a>
@@ -1912,8 +2073,11 @@ document.addEventListener('DOMContentLoaded', function() {
   sprintf(the_page, msg, devname, devname, vernum, strdate, use, tot, rssi, avi_file_name,
           framesize, quality, frame_cnt, frame_interval, stream_delay,
           most_recent_avg_framesize, most_recent_fps, time_left,
-          localip, localip, localip, localip, localip, localip, localip, localip, filemanagerport,
-          localip, localip,  localip  );
+          localip, localip,
+          localip,
+          localip, localip, localip,
+          localip, filemanagerport,
+          localip, localip, localip);
 
   httpd_resp_send(req, the_page, strlen(the_page));
 
@@ -2274,249 +2438,189 @@ static esp_err_t restart_handler(httpd_req_t *req) {
 //  Streaming stuff based on Random Nerd
 //
 
-bool start_streaming = false;
-volatile bool stream_82 = false;
 volatile bool stream_81 = false;
-
-httpd_req_t *req_82;
-httpd_req_t *req_81;
+volatile bool stream_frame_needed = false;
+volatile uint32_t stream_frame_sequence = 0;
 
 #define PART_BOUNDARY "123456789000000000000987654321"
 
 static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
 static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
-
-void the_streaming_loop (void* pvParameter);
-int stream_81_frames ;
-long stream_81_start ;
-int stream_82_frames ;
-long stream_82_start ;
+const uint32_t STREAM_FRAME_WAIT_TIMEOUT_MS = 2000;
+const uint16_t STREAM_SEND_TIMEOUT_SECONDS = 5;
 
 void copy_frame_for_active_stream(camera_fb_t *frame) {
-  if ((!stream_81 && !stream_82) || frame == NULL) return;
+  if (!stream_81 || !stream_frame_needed || frame == NULL) return;
+
+  if (frame->len > WEB_FRAMEBUFFER_CAPACITY) {
+    Serial.printf("Stream frame too large: %u > %u bytes\n",
+                  (unsigned int)frame->len,
+                  (unsigned int)WEB_FRAMEBUFFER_CAPACITY);
+    stream_frame_needed = false;
+    return;
+  }
 
   xSemaphoreTake(baton, portMAX_DELAY);
-  framebuffer_len = frame->len;
-  memcpy(framebuffer, frame->buf, frame->len);
-  framebuffer_time = millis();
+  if (stream_81 && stream_frame_needed) {
+    framebuffer_len = frame->len;
+    memcpy(framebuffer, frame->buf, frame->len);
+    framebuffer_time = millis();
+    stream_frame_sequence++;
+    stream_frame_needed = false;
+  }
   xSemaphoreGive(baton);
 }
 
-static esp_err_t stream_82_handler(httpd_req_t *req) {
+bool copy_next_stream_frame(uint32_t previous_sequence,
+                            uint32_t *copied_sequence,
+                            size_t *copied_length) {
+  uint32_t wait_started_at = millis();
 
-  esp_err_t res;
-  long start = millis();
+  while (stream_81 && !safe_stop_requested &&
+         (uint32_t)(millis() - wait_started_at) < STREAM_FRAME_WAIT_TIMEOUT_MS) {
+    bool copied = false;
 
-  Serial.print("stream_82_handler, core ");  Serial.print(xPortGetCoreID());
-  Serial.print(", priority = "); Serial.println(uxTaskPriorityGet(NULL));
-
-  stream_82 = true;
-  req_82 = req;
-
-  stream_82_frames = 0;
-  stream_82_start = millis();
-
-  if (stream_82) {
-    res = httpd_resp_set_type(req_82, _STREAM_CONTENT_TYPE);
-    if (res != ESP_OK) {
-      stream_82 = false;
+    xSemaphoreTake(baton, portMAX_DELAY);
+    if (stream_frame_sequence != previous_sequence &&
+        framebuffer_len > 0 &&
+        (size_t)framebuffer_len <= WEB_FRAMEBUFFER_CAPACITY) {
+      *copied_length = framebuffer_len;
+      memcpy(framebuffer2, framebuffer, *copied_length);
+      *copied_sequence = stream_frame_sequence;
+      copied = true;
     }
+    xSemaphoreGive(baton);
+
+    if (copied) return true;
+    delay(10);
   }
 
-  time_in_web1 += (millis() - start);
+  return false;
+}
 
-  while (stream_82 == true) {          // we have to keep the *req alive
-    delay(1000);
-    //Serial.print("<82>");
+esp_err_t send_stream_chunk(httpd_req_t *req,
+                            const char *data,
+                            size_t length,
+                            const char *stage) {
+  uint32_t send_started_at = millis();
+  errno = 0;
+  esp_err_t result = httpd_resp_send_chunk(req, data, length);
+  int socket_errno = errno;
+  if (result != ESP_OK) {
+    int32_t rssi = wifi_mode == RECORDER_WIFI_STA && WiFi.status() == WL_CONNECTED
+                     ? WiFi.RSSI()
+                     : 0;
+    Serial.printf("Live stream %s send failed: 0x%x (%s), %u bytes after %u ms; errno=%d (%s)",
+                  stage,
+                  result,
+                  esp_err_to_name(result),
+                  (unsigned int)length,
+                  (unsigned int)(millis() - send_started_at),
+                  socket_errno,
+                  socket_errno == 0 ? "not reported" : strerror(socket_errno));
+    if (rssi != 0) Serial.printf(", RSSI %ld dBm", (long)rssi);
+    Serial.println();
   }
-  Serial.println(" stream_82 done");
-  delay(500);
-  req_81 = NULL;
-  return ESP_OK;
+  return result;
 }
 
 static esp_err_t stream_81_handler(httpd_req_t *req) {
+  if (stream_81) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Retry-After", "2");
+    httpd_resp_sendstr(req, "A live-stream client is already connected.\n");
+    return ESP_OK;
+  }
 
-  esp_err_t res;
-  long start = millis();
-
-  Serial.print("stream_81_handler, core ");  Serial.print(xPortGetCoreID());
+  Serial.print("live stream handler, core ");  Serial.print(xPortGetCoreID());
   Serial.print(", priority = "); Serial.println(uxTaskPriorityGet(NULL));
+
+  const uint32_t handler_started_at = millis();
+  uint32_t stream_frames = 0;
+  uint32_t last_sequence;
+  int socket_fd = httpd_req_to_sockfd(req);
+  esp_err_t result = ESP_OK;
+
+  xSemaphoreTake(baton, portMAX_DELAY);
+  last_sequence = stream_frame_sequence;
+  xSemaphoreGive(baton);
 
   stream_81 = true;
-  req_81 = req;
-  stream_81_frames = 0;
-  stream_81_start = millis();
+  stream_frame_needed = true;
+  apply_streaming_sta_power();
 
-  time_in_web1 += (millis() - start);
+  result = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+  if (result == ESP_OK) result = httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
+  if (result == ESP_OK) result = httpd_resp_set_hdr(req, "Pragma", "no-cache");
 
-  if (stream_81) {
-    res = httpd_resp_set_type(req_81, _STREAM_CONTENT_TYPE);
-    if (res != ESP_OK) {
-      stream_81 = false;
+  while (result == ESP_OK && stream_81 && !safe_stop_requested) {
+    size_t jpg_length = 0;
+    uint32_t copied_sequence = last_sequence;
+
+    if (!copy_next_stream_frame(last_sequence, &copied_sequence, &jpg_length)) {
+      if (stream_81 && !safe_stop_requested) {
+        Serial.println("Live stream frame wait timed out; waiting for the next camera frame");
+        stream_frame_needed = true;
+      }
+      continue;
     }
+
+    last_sequence = copied_sequence;
+    char part_buffer[96];
+    size_t part_length = snprintf(part_buffer, sizeof(part_buffer), _STREAM_PART, jpg_length);
+    uint32_t send_started_at = millis();
+
+    result = send_stream_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY), "boundary");
+    if (result == ESP_OK) result = send_stream_chunk(req, part_buffer, part_length, "header");
+    if (result == ESP_OK) {
+      result = send_stream_chunk(req, (const char *)framebuffer2, jpg_length, "JPEG");
+    }
+
+    if (result != ESP_OK) break;
+
+    stream_frames++;
+    if (Lots_of_Stats && stream_frames % 100 == 10) {
+      float stream_fps = 1000.0f * stream_frames / (millis() - handler_started_at);
+      Serial.printf("Live stream at %.2f fps\n", stream_fps);
+    }
+
+    uint32_t send_elapsed = millis() - send_started_at;
+    int32_t remaining_delay = stream_delay - (int32_t)send_elapsed;
+    delay(remaining_delay > 10 ? remaining_delay : 10);
+
+    // Request one new camera frame only after the previous frame has been sent.
+    // Slow clients therefore drop intermediate frames instead of building a queue.
+    stream_frame_needed = true;
   }
 
-  while (stream_81 == true) {          // we have to keep the *req alive
-    delay(1000);
-    //Serial.print("<81>");
+  stream_frame_needed = false;
+  stream_81 = false;
+  restore_idle_sta_power_save();
+
+  if (result == ESP_OK) {
+    httpd_resp_send_chunk(req, NULL, 0);
+  } else if (socket_fd >= 0) {
+    httpd_sess_trigger_close(req->handle, socket_fd);
   }
-  Serial.println(" stream_81 done");
-  delay(500);
-  req_81 = NULL;
-  return ESP_OK;
-}
 
-
-////////////////////////////////
-//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-//
-//  Streaming stuff based on Random Nerd
-//
-
-
-void the_streaming_loop (void* pvParameter) {
-
-  camera_fb_t * fb = NULL;
-  esp_err_t res = ESP_OK;
-  size_t _jpg_buf_len = 0;
-  uint8_t * _jpg_buf = NULL;
-  char * part_buf[64];
-
-  long start = millis();
-
-  Serial.print("\n\nlow prio streaming loop, core ");  Serial.print(xPortGetCoreID());
-  Serial.print(", priority = "); Serial.println(uxTaskPriorityGet(NULL));
-
-  //req = (httpd_req_t *) pvParameter;
-
-  Serial.println("Starting the streaming");
-
-  while (true) {
-    if (!stream_81 && !stream_82) {
-      delay(1000);
-    } else {
-      if (stream_81) stream_81_frames++;
-      if (stream_82) stream_82_frames++;
-
-      xSemaphoreTake( baton, portMAX_DELAY );
-
-      if (framebuffer_time > (millis() - 200)) {
-        //Serial.printf("*");
-        framebuffer2_len = framebuffer_len;
-        framebuffer2_time = framebuffer_time;
-        memcpy(framebuffer2, framebuffer,  framebuffer_len);  // v59.5
-        xSemaphoreGive( baton );
-      } else {
-        xSemaphoreGive( baton );
-        fb = esp_camera_fb_get(); //get_good_jpeg();
-        //Serial.println("loop take");
-        //Serial.printf("millis %d, fb1 %d, fb2 %d\n", millis(), framebuffer_time, framebuffer2_time);
-        if (!fb) {
-          Serial.println("Photos - Camera Capture Failed");
-          //start_streaming = false;
-        }
-        xSemaphoreTake( baton, portMAX_DELAY );
-        framebuffer2_len = fb->len;
-        framebuffer2_time = millis();
-        memcpy(framebuffer2, fb->buf, fb->len);
-        xSemaphoreGive( baton );
-        esp_camera_fb_return(fb);
-      }
-
-      _jpg_buf_len = framebuffer2_len;
-      _jpg_buf = framebuffer2;
-
-      size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
-
-      long send_time = millis();
-      long xx;
-      xx = millis();
-
-      if (stream_82) {
-        res = httpd_resp_send_chunk(req_82, (const char *)part_buf, hlen);
-        if (res != ESP_OK) {
-          stream_82 = false;
-          Serial.printf("Stream error - 82/1st %d\n", res);
-        }
-      }
-      if (stream_81) {
-        res = httpd_resp_send_chunk(req_81, (const char *)part_buf, hlen);
-        if (res != ESP_OK) {
-          stream_81 = false;
-          Serial.printf("Stream error - 81/1st %d\n", res);
-        }
-      }
-
-      xx = millis();
-
-      if (stream_82) {
-        res = httpd_resp_send_chunk(req_82, (const char *)_jpg_buf, _jpg_buf_len);
-        if (res != ESP_OK) {
-          stream_82 = false;
-          Serial.printf("Stream error - 82/2nd %d\n", res);
-        }
-      }
-      if (stream_81) {
-        res = httpd_resp_send_chunk(req_81, (const char *)_jpg_buf, _jpg_buf_len);
-        if (res != ESP_OK) {
-          stream_81 = false;
-          Serial.printf("Stream error - 81/2nd %d\n", res);
-        }
-      }
-
-      xx = millis();
-
-      if (stream_82) {
-        res = httpd_resp_send_chunk(req_82, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
-        if (res != ESP_OK) {
-          stream_82 = false;
-          Serial.printf("Stream error - 82/3rd %d\n", res);
-        }
-      }
-      if (stream_81) {
-        res = httpd_resp_send_chunk(req_81, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
-        if (res != ESP_OK) {
-          stream_81 = false;
-          Serial.printf("Stream error - 81/3rd %d\n", res);
-        }
-      }
-
-      if (stream_81_frames % 100 == 10) {
-        if (Lots_of_Stats) {
-          Serial.printf("Stream 81 at %3.3f fps\n", (float)1000 * stream_81_frames / (millis() - stream_81_start));
-        }
-      }
-      if (stream_82_frames % 100 == 10) {
-        if (Lots_of_Stats) {
-          Serial.printf("Stream 82 at %3.3f fps\n", (float)1000 * stream_82_frames / (millis() - stream_82_start));
-        }
-      }
-
-      int new_delay = stream_delay - (millis() - send_time);
-      //Serial.printf(", streamdelay %5d, send_time %5d, newdelay %5d\n", stream_delay, millis() - send_time, new_delay);
-      if (millis() - send_time > 5000) {
-        new_delay = 1000;
-        Serial.printf("wifi slow %d - take a 1s break\n", millis() - send_time);
-      }
-
-      if (new_delay < 10) {
-        new_delay = 10;
-      }
-
-      delay(new_delay) ; //delay(stream_delay);
-
-      start = millis();
-
-    }
-  }  // stream forever
+  time_in_web1 += millis() - handler_started_at;
+  Serial.printf("Live stream closed after %u frames\n", stream_frames);
+  return result;
 }
 
 void start_Stream_81_server() {
+  if (stream_httpd_81 != NULL) return;
+
   httpd_config_t config2 = HTTPD_DEFAULT_CONFIG();
   config2.server_port = 81;
   config2.ctrl_port = 32123; //         = 32768,
+  config2.stack_size = 6144;
+  config2.backlog_conn = 1;
+  config2.lru_purge_enable = true;
+  config2.recv_wait_timeout = STREAM_SEND_TIMEOUT_SECONDS;
+  config2.send_wait_timeout = STREAM_SEND_TIMEOUT_SECONDS;
   Serial.print("http Stream task prio: "); Serial.println(config2.task_priority);
 
   httpd_uri_t stream_uri = {
@@ -2526,40 +2630,19 @@ void start_Stream_81_server() {
     .user_ctx  = NULL
   };
 
-  if (httpd_start(&stream_httpd, &config2) == ESP_OK) {
-    httpd_register_uri_handler(stream_httpd, &stream_uri);
+  if (httpd_start(&stream_httpd_81, &config2) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd_81, &stream_uri);
+    Serial.println("Live stream http started on port 81 (one client, 5 second send timeout)");
   } else {
     Serial.println("Error with stream start 81");
   }
-
-  Serial.println("Stream 81 http started");
-}
-
-void start_Stream_82_server() {
-  httpd_config_t config2 = HTTPD_DEFAULT_CONFIG();
-  config2.server_port = 82;
-  config2.ctrl_port = 32124; //         = 32768,
-  Serial.print("http Stream task prio: "); Serial.println(config2.task_priority);
-
-  httpd_uri_t stream_uri = {
-    .uri       = "/stream",
-    .method    = HTTP_GET,
-    .handler   = stream_82_handler,
-    .user_ctx  = NULL
-  };
-
-  if (httpd_start(&stream_httpd, &config2) == ESP_OK) {
-    httpd_register_uri_handler(stream_httpd, &stream_uri);
-  } else {
-    Serial.println("Error with stream start 82");
-  }
-
-  Serial.println("Stream 82 http started");
 }
 
 ////////////////////////////////
 
 void startCameraServer() {
+  if (camera_httpd != NULL) return;
+
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.max_uri_handlers = 8;
   config.stack_size = 4096 + 1024;
@@ -2643,7 +2726,17 @@ void startCameraServer() {
 }
 
 void stopCameraServer() {
-  httpd_stop(camera_httpd);
+  stream_81 = false;
+  stream_frame_needed = false;
+
+  if (camera_httpd != NULL) {
+    httpd_stop(camera_httpd);
+    camera_httpd = NULL;
+  }
+  if (stream_httpd_81 != NULL) {
+    httpd_stop(stream_httpd_81);
+    stream_httpd_81 = NULL;
+  }
 }
 
 void the_camera_loop (void* pvParameter);
@@ -2732,6 +2825,13 @@ void park_camera_for_safe_shutdown() {
   vTaskDelete(NULL);
 }
 
+bool wifi_switch_requests_on() {
+  int first_sample = digitalRead(44);
+  delay(20);
+  int second_sample = digitalRead(44);
+  return first_sample == HIGH && second_sample == HIGH;
+}
+
 void setup() {
 
   Serial.begin(115200);
@@ -2811,10 +2911,25 @@ void setup() {
 
   read_config_file();
 
-  if (wifi_mode == RECORDER_WIFI_OFF) {
-    WiFi.mode(WIFI_OFF);
-    InternetOff = true;
+  bool wifi_requested_at_startup =
+    wifi_mode != RECORDER_WIFI_OFF && wifi_switch_requests_on();
+
+  if (reason == ESP_RST_BROWNOUT && wifi_mode != RECORDER_WIFI_OFF) {
+    wifi_suppressed_after_brownout = true;
+    Serial.println("Brownout recovery: WiFi is disabled for this boot to prevent a reset loop");
+    stop_wifi_completely();
+  } else if (wifi_requested_at_startup) {
+    Serial.println("Starting WiFi before camera initialization with power staging ...");
+    if (!init_wifi_with_power_staging()) {
+      Serial.println("Startup WiFi failed; recording will continue with WiFi off");
+    }
+  } else {
+    stop_wifi_completely();
   }
+
+  // Persist the file group only after the high-current WiFi startup phase.
+  // A WiFi brownout therefore cannot write EEPROM on every reboot attempt.
+  do_eprom_write();
 
   char logname[50];
   sprintf(logname, "/%s%04d.999.txt",  devname, file_group);
@@ -2854,15 +2969,28 @@ void setup() {
     #else
     logfile.println("ESP32 Arduino core: unknown");
     #endif
+    if (reason == ESP_RST_BROWNOUT) {
+      logfile.println("Reset reason: ESP_RST_BROWNOUT");
+    }
+    if (wifi_suppressed_after_brownout) {
+      logfile.println("Brownout recovery: WiFi disabled for this boot");
+    }
   }
   Serial.println("Setting up the camera ...");
   config_camera();
 
   Serial.println("Checking SD for available space ...");
   delete_old_stuff();
-  framebuffer = (uint8_t*)ps_malloc(512 * 1024); // buffer to store a jpg in motion // needs to be larger for big frames from ov5640
-  framebuffer2 = (uint8_t*)ps_malloc(512 * 1024); // buffer to store a jpg in motion // needs to be larger for big frames from ov5640
-  framebuffer3 = (uint8_t*)ps_malloc(512 * 1024); // buffer to store a jpg in motion // needs to be larger for big frames from ov5640
+  framebuffer = (uint8_t*)ps_malloc(WEB_FRAMEBUFFER_CAPACITY); // latest camera frame for Web clients
+  framebuffer2 = (uint8_t*)ps_malloc(WEB_FRAMEBUFFER_CAPACITY); // frame currently being sent to the stream client
+  framebuffer3 = (uint8_t*)ps_malloc(WEB_FRAMEBUFFER_CAPACITY); // still-image capture response
+
+  if (framebuffer == NULL || framebuffer2 == NULL || framebuffer3 == NULL) {
+    Serial.println("Failed to allocate Web frame buffers in PSRAM");
+    if (logfile) logfile.println("Failed to allocate Web frame buffers in PSRAM");
+    major_fail();
+    return;
+  }
 
   Serial.println("Creating the_camera_loop_task");
 
@@ -2890,42 +3018,32 @@ void setup() {
 
   delay(200);
 
-  xTaskCreatePinnedToCore( the_streaming_loop, "the_streaming_loop", 8000, NULL, 3, &the_streaming_loop_task, 1);
-
-  if ( the_streaming_loop_task == NULL ) {
-    //vTaskDelete( xHandle );
-    Serial.printf("do_the_steaming_task failed to start! %d\n", the_streaming_loop_task);
-  }
-
   boot_time = millis();
 
   const char *strdate = ctime(&now);
   logfile.println(strdate);
 
-  if ( !InternetOff && wifi_mode == RECORDER_WIFI_AP ) {
-    filemgr.begin();
-    filemgr.setBackGroundColor("Gray");
-    Serial.print("Open Filemanager with http://");
-    Serial.print(WiFi.softAPIP());
-    Serial.print(":");
-    Serial.print(filemanagerport);
-    Serial.print("/");
-    Serial.println();
-  } else if ( !InternetOff && wifi_mode == RECORDER_WIFI_STA ) {
-    filemgr.begin();
-    filemgr.setBackGroundColor("Gray");
-    Serial.print("Open Filemanager with http://");
-    Serial.print(WiFi.localIP());
-    Serial.print(":");
-    Serial.print(filemanagerport);
-    Serial.print("/");
-    Serial.println();
-  }
-
   //digitalWrite(33, HIGH);         // red light turns off when setup is complete
     //追記
   sensor_t *sensor = esp_camera_sensor_get();
   camera_setting(sensor);
+
+  if (!InternetOff) {
+    Serial.println("Starting Web Services ...");
+    startCameraServer();
+    start_Stream_81_server();
+    filemgr.begin();
+    filemgr.setBackGroundColor("Gray");
+    Serial.print("Open Filemanager with http://");
+    if (wifi_mode == RECORDER_WIFI_AP) {
+      Serial.print(WiFi.softAPIP());
+    } else {
+      Serial.print(WiFi.localIP());
+    }
+    Serial.print(":");
+    Serial.print(filemanagerport);
+    Serial.println("/");
+  }
 
   Serial.println("  End of setup()\n\n");
 }
@@ -2978,9 +3096,13 @@ void loop() {
   poll_safe_stop_button();
 
   if (safe_stop_requested) {
-    // Latch recording off and stop the only web service that accesses the SD card.
+    // Latch recording off and stop every service that can access the camera or SD card.
     start_record = 0;
-    filemgr.end();
+    if (!InternetOff) {
+      filemgr.end();
+      stopCameraServer();
+      stop_wifi_completely();
+    }
 
     if (recording_closed_for_shutdown && !safe_stop_complete) {
       perform_safe_sd_shutdown();
@@ -3015,7 +3137,7 @@ void loop() {
   delay(20);
   read13 = read13 + digitalRead(44); // Pin 13を44に変更 // get 2 opinions to help poor soldering
 
-  if (wifi_mode != RECORDER_WIFI_OFF) {
+  if (wifi_mode != RECORDER_WIFI_OFF && !wifi_suppressed_after_brownout) {
     if (read13 > 0) {
       read13 = 0;
     } else {
@@ -3023,15 +3145,12 @@ void loop() {
     }
   }
 
-  if (wifi_mode != RECORDER_WIFI_OFF) {
+  if (wifi_mode != RECORDER_WIFI_OFF && !wifi_suppressed_after_brownout) {
     if (read13 == 2 && !InternetOff) {
       Serial.println("Shutting off wifi ..."); logfile.println("Shutting off wifi ...");
       filemgr.end();
       stopCameraServer();
-      //WiFiManager wm;
-      //wm.disconnect();
-      WiFi.disconnect();
-      InternetOff = true;
+      stop_wifi_completely();
     }
     static uint32_t next_wifi_retry = 0;
     if (read13 == 0 && InternetOff && (int32_t)(millis() - next_wifi_retry) >= 0) {
@@ -3041,8 +3160,8 @@ void loop() {
         Serial.println("Starting Web Services ...");
         startCameraServer();
         start_Stream_81_server();
-        start_Stream_82_server();
         filemgr.begin();
+        filemgr.setBackGroundColor("Gray");
         InternetOff = false;
       } else {
         Serial.println("WiFi start failed; retrying in 30 seconds");
@@ -3129,6 +3248,20 @@ void the_camera_loop (void* pvParameter) {
       //digitalWrite(RecordingLEDGND, LOW);
       digitalWrite(GPIOGNDPin, LOW);
       digitalWrite(GPIOVPin, LOW);
+
+      // While recording is stopped, the camera task remains the sole owner of
+      // camera capture and produces a frame only when the stream client asks.
+      if (stream_81 && stream_frame_needed) {
+        camera_fb_t *stream_frame = esp_camera_fb_get();
+        if (stream_frame != NULL) {
+          copy_frame_for_active_stream(stream_frame);
+          esp_camera_fb_return(stream_frame);
+        } else {
+          Serial.println("Live stream camera capture failed");
+        }
+        delay(10);
+        continue;
+      }
       
       // Serial.println("Do nothing");
       if (we_are_already_stopped == 0) Serial.println("\n\nDisconnect Pin 12 from GND to start recording.\n\n");
