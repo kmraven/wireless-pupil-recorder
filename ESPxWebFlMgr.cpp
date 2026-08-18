@@ -21,6 +21,7 @@
 #include <WebServer.h>
 #include <FS.h>
 #include <SD.h>
+#include <detail/RequestHandlersImpl.h>
 #endif
 
 
@@ -29,19 +30,7 @@ String getContentType(const String& path) {
   return mime::getContentType(path);
 #endif
 #ifdef ESP32
-  if (path.endsWith(".html") || path.endsWith(".htm")) return "text/html";
-  if (path.endsWith(".css")) return "text/css";
-  if (path.endsWith(".js")) return "application/javascript";
-  if (path.endsWith(".json")) return "application/json";
-  if (path.endsWith(".txt") || path.endsWith(".csv")) return "text/plain";
-  if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
-  if (path.endsWith(".png")) return "image/png";
-  if (path.endsWith(".gif")) return "image/gif";
-  if (path.endsWith(".svg")) return "image/svg+xml";
-  if (path.endsWith(".pdf")) return "application/pdf";
-  if (path.endsWith(".zip")) return "application/zip";
-  if (path.endsWith(".avi")) return "video/x-msvideo";
-  return "application/octet-stream";
+  return StaticRequestHandler::getContentType(path);
 #endif
 }
 
