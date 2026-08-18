@@ -154,7 +154,7 @@ String czone;
 String cstaticip;
 String cgateway;
 String csubnet;
-String cdns;
+String configured_dns;
 
 TaskHandle_t the_camera_loop_task;
 TaskHandle_t the_sd_loop_task;
@@ -201,7 +201,6 @@ camera_fb_t * fb_next = NULL;
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "soc/soc.h"
-#include "soc/cpu.h"
 #include "soc/rtc_cntl_reg.h"
 
 static esp_err_t cam_err;
@@ -812,7 +811,7 @@ void read_config_file() {
   cstaticip = cstaticipvalue;
   cgateway = cgatewayvalue;
   csubnet = csubnetvalue;
-  cdns = cdnsvalue;
+  configured_dns = cdnsvalue;
   configfile = true;
   TIMEZONE = czone;
 
@@ -1601,7 +1600,7 @@ bool init_wifi() {
       IPAddress subnet;
       IPAddress dns;
       if (!static_ip.fromString(cstaticip) || !gateway.fromString(cgateway) ||
-          !subnet.fromString(csubnet) || !dns.fromString(cdns)) {
+          !subnet.fromString(csubnet) || !dns.fromString(configured_dns)) {
         Serial.println("Invalid static IPv4 configuration");
         WiFi.mode(WIFI_OFF);
         return finish_wifi_init(false);
