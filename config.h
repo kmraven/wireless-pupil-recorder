@@ -18,12 +18,23 @@ YOUR_WIFI_PASSWORD  // STA password, or ESP32 AP password (8-63 chars) in AP mod
 192.168.1.1  // gateway; used only when STA IP mode=1
 255.255.255.0  // subnet mask; used only when STA IP mode=1
 192.168.1.1  // DNS server; used only when STA IP mode=1
+70  // camera exposure: -1=auto, 0-1200=manual sensor value
+5  // camera gain: -1=auto, 0-30=manual gain
+12  // JPEG quality: 0-63; lower values=higher quality and larger files
+1  // brightness: -2 to 2
+0  // contrast: -2 to 2
+-2  // saturation: -2 to 2
+0  // auto-exposure level: -2 to 2; used only when exposure=-1
+0  // auto-gain ceiling: 0=2x, 1=4x, ... 6=128x; used only when gain=-1
+-1  // white balance: -1=off, 0=auto, 1=sunny, 2=cloudy, 3=office, 4=home
+0  // horizontal mirror: 0=off, 1=on
+0  // vertical flip: 0=off, 1=on
 
 Connection addresses:
 - STA + DHCP: http://<camera-name>.local/
 - STA + static IPv4: http://<static-IPv4-address>/
 - AP: join the configured AP SSID, then open http://192.168.4.1/
-- Live MJPEG stream: append :81/stream or :82/stream
+- Live MJPEG stream: append :81/stream
 - SD file manager: append :8080/
 )CONFIG";
 

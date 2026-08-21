@@ -132,9 +132,35 @@ const int DEFAULT_FRAME_SIZE_INDEX = 11;        // Stable config index: HD 1280x
 const int DEFAULT_FRAME_BUFFER_SIZE_INDEX = 13; // Stable config index: UXGA 1600x1200
 const int MIN_FRAME_SIZE_INDEX = 0;
 const int MAX_FRAME_SIZE_INDEX = 21;
+const int CAMERA_SETTING_AUTO = -1;
+const int DEFAULT_CAMERA_EXPOSURE_VALUE = 70;
+const int MIN_CAMERA_EXPOSURE_VALUE = 0;
+const int MAX_CAMERA_EXPOSURE_VALUE = 1200;
+const int DEFAULT_CAMERA_GAIN_VALUE = 5;
+const int MIN_CAMERA_GAIN_VALUE = 0;
+const int MAX_CAMERA_GAIN_VALUE = 30;
+const int DEFAULT_CAMERA_JPEG_QUALITY = 12;
+const int MIN_CAMERA_JPEG_QUALITY = 0;
+const int MAX_CAMERA_JPEG_QUALITY = 63;
+const int DEFAULT_CAMERA_BRIGHTNESS = 1;
+const int DEFAULT_CAMERA_CONTRAST = 0;
+const int DEFAULT_CAMERA_SATURATION = -2;
+const int MIN_CAMERA_IMAGE_LEVEL = -2;
+const int MAX_CAMERA_IMAGE_LEVEL = 2;
+const int DEFAULT_CAMERA_AE_LEVEL = 0;
+const int MIN_CAMERA_GAIN_CEILING = 0;
+const int MAX_CAMERA_GAIN_CEILING = 6;
+const int DEFAULT_CAMERA_GAIN_CEILING = 0;
+const int CAMERA_WHITE_BALANCE_OFF = -1;
+const int DEFAULT_CAMERA_WHITE_BALANCE_MODE = CAMERA_WHITE_BALANCE_OFF;
+const int MIN_CAMERA_WHITE_BALANCE_MODE = CAMERA_WHITE_BALANCE_OFF;
+const int MAX_CAMERA_WHITE_BALANCE_MODE = 4;
+const int DEFAULT_CAMERA_HMIRROR = 0;
+const int DEFAULT_CAMERA_VFLIP = 0;
+const int CURRENT_CONFIG_LINE_COUNT = 27;
 
 int framesize = DEFAULT_FRAME_SIZE_INDEX;
-int quality = 12;
+int quality = DEFAULT_CAMERA_JPEG_QUALITY;
 int framesizeconfig = DEFAULT_FRAME_BUFFER_SIZE_INDEX;
 int qualityconfig = 5;
 int buffersconfig = 3;
@@ -144,6 +170,16 @@ int speed_up_factor = 1;          // play at realtime
 int stream_delay = 500;           // minimum of 500 ms delay between frames
 int MagicNumber = 12;                // change this number to reset the eprom in your esp32 for file numbers
 int max_recordings = 0;           // 0 records continuously until stopped
+int camera_exposure_value = DEFAULT_CAMERA_EXPOSURE_VALUE;
+int camera_gain_value = DEFAULT_CAMERA_GAIN_VALUE;
+int camera_brightness = DEFAULT_CAMERA_BRIGHTNESS;
+int camera_contrast = DEFAULT_CAMERA_CONTRAST;
+int camera_saturation = DEFAULT_CAMERA_SATURATION;
+int camera_ae_level = DEFAULT_CAMERA_AE_LEVEL;
+int camera_gain_ceiling = DEFAULT_CAMERA_GAIN_CEILING;
+int camera_white_balance_mode = DEFAULT_CAMERA_WHITE_BALANCE_MODE;
+int camera_hmirror = DEFAULT_CAMERA_HMIRROR;
+int camera_vflip = DEFAULT_CAMERA_VFLIP;
 uint32_t completed_recordings = 0;
 const uint32_t AVI_FLUSH_INTERVAL_MS = 1000;
 const uint32_t SD_TASK_STACK_SIZE = 8192;
@@ -522,14 +558,6 @@ static void config_camera() {
 
   Serial.printf("\nCamera started correctly, Type is %x (hex) of 9650, 7725, 2640, 3660, 5640\n\n", ss->id.PID);
 
-  if (ss->id.PID == OV5640_PID ) {
-    //Serial.println("56 - going mirror");
-    ss->set_hmirror(ss, 1);        // 0 = disable , 1 = enable
-  } else {
-    ss->set_hmirror(ss, 0);        // 0 = disable , 1 = enable
-  }
-
-  ss->set_quality(ss, quality);
   if (ss->set_framesize(ss, recording_driver_frame_size) != 0) {
     Serial.printf("Failed to set recording frame-size index %d (driver enum %d)\n",
                   framesize, (int)recording_driver_frame_size);
@@ -538,8 +566,8 @@ static void config_camera() {
   Serial.printf("Recording frame-size index %d -> driver enum %d\n",
                 framesize, (int)recording_driver_frame_size);
 
-  ss->set_brightness(ss, 1);  //up the blightness just a bit
-  ss->set_saturation(ss, -2); //lower the saturation
+  // Apply every user-facing sensor setting before discarding warm-up frames.
+  camera_setting(ss);
 
   delay(500);
   for (int j = 0; j < 10; j++) {
@@ -639,6 +667,13 @@ bool is_single_digit_config_value(const String &value) {
   return value.length() == 1 && value.charAt(0) >= '0' && value.charAt(0) <= '9';
 }
 
+int validate_config_range(const char *name, int value, int minimum, int maximum, int default_value) {
+  if (value >= minimum && value <= maximum) return value;
+
+  Serial.printf("Invalid %s value %d; using %d\n", name, value, default_value);
+  return default_value;
+}
+
 void read_config_file() {
 
   // if there is a config.txt, use it plus defaults
@@ -680,18 +715,30 @@ void read_config_file() {
     192.168.1.1  // gateway
     255.255.255.0  // subnet mask
     192.168.1.1  // DNS server
+    70  // camera exposure: -1=auto, 0-1200=manual sensor value
+    5  // camera gain: -1=auto, 0-30=manual gain
+    12  // JPEG quality: 0-63, lower values give higher quality and larger files
+    1  // brightness: -2 to 2
+    0  // contrast: -2 to 2
+    -2  // saturation: -2 to 2
+    0  // automatic-exposure level: -2 to 2; used when exposure=-1
+    0  // automatic-gain ceiling: 0=2x, 1=4x, ... 6=128x; used when gain=-1
+    -1  // white balance: -1=off, 0=auto, 1=sunny, 2=cloudy, 3=office, 4=home
+    0  // horizontal mirror: 0=off, 1=on
+    0  // vertical flip: 0=off, 1=on
     ~~~
 
     In STA/DHCP mode, browse to http://<camera-name>.local/.
     In STA/static mode, browse to the configured static IPv4 address.
     In AP mode, join the configured SSID and browse to http://192.168.4.1/.
 
+    Existing 16- or 18-line config files retain all former camera defaults.
     The previous 16-line layout and old config files with SSID on line 8 remain supported.
   */
 
   String cname = "desklens";
   int cframesize = DEFAULT_FRAME_SIZE_INDEX;
-  int cquality = 12;
+  int cquality = DEFAULT_CAMERA_JPEG_QUALITY;
   int cframesizeconfig = DEFAULT_FRAME_BUFFER_SIZE_INDEX;
   int cqualityconfig = 5;
   int cbuffersconfig = 4; //58.9
@@ -709,14 +756,24 @@ void read_config_file() {
   String cgatewayvalue = "192.168.1.1";
   String csubnetvalue = "255.255.255.0";
   String cdnsvalue = "192.168.1.1";
+  int ccameraexposurevalue = DEFAULT_CAMERA_EXPOSURE_VALUE;
+  int ccameragainvalue = DEFAULT_CAMERA_GAIN_VALUE;
+  int ccamerabrightness = DEFAULT_CAMERA_BRIGHTNESS;
+  int ccameracontrast = DEFAULT_CAMERA_CONTRAST;
+  int ccamerasaturation = DEFAULT_CAMERA_SATURATION;
+  int ccameraaelevel = DEFAULT_CAMERA_AE_LEVEL;
+  int ccameragainceiling = DEFAULT_CAMERA_GAIN_CEILING;
+  int ccamerawhitebalancemode = DEFAULT_CAMERA_WHITE_BALANCE_MODE;
+  int ccamerahmirror = DEFAULT_CAMERA_HMIRROR;
+  int ccameravflip = DEFAULT_CAMERA_VFLIP;
 
   File config_file =SD.open("/config.txt", "r");
   if (config_file) {
 
     Serial.println("Reading config.txt");
-    String config_values[16];
+    String config_values[CURRENT_CONFIG_LINE_COUNT];
     int config_value_count = 0;
-    while (config_value_count < 16 && config_file.available()) {
+    while (config_value_count < CURRENT_CONFIG_LINE_COUNT && config_file.available()) {
       config_values[config_value_count++] = read_config_value(config_file);
     }
     config_file.close();
@@ -776,6 +833,44 @@ void read_config_file() {
       if (config_values[14].length() > 0) csubnetvalue = config_values[14];
       if (config_values[15].length() > 0) cdnsvalue = config_values[15];
 
+      // Exposure and gain were added after the 16-line formats. Missing or
+      // non-numeric values retain the former hardcoded defaults (70 and 5).
+      if (reordered_layout) {
+        if (config_value_count > 16 && is_config_integer(config_values[16])) {
+          ccameraexposurevalue = config_values[16].toInt();
+        }
+        if (config_value_count > 17 && is_config_integer(config_values[17])) {
+          ccameragainvalue = config_values[17].toInt();
+        }
+        if (config_value_count > 18 && is_config_integer(config_values[18])) {
+          cquality = config_values[18].toInt();
+        }
+        if (config_value_count > 19 && is_config_integer(config_values[19])) {
+          ccamerabrightness = config_values[19].toInt();
+        }
+        if (config_value_count > 20 && is_config_integer(config_values[20])) {
+          ccameracontrast = config_values[20].toInt();
+        }
+        if (config_value_count > 21 && is_config_integer(config_values[21])) {
+          ccamerasaturation = config_values[21].toInt();
+        }
+        if (config_value_count > 22 && is_config_integer(config_values[22])) {
+          ccameraaelevel = config_values[22].toInt();
+        }
+        if (config_value_count > 23 && is_config_integer(config_values[23])) {
+          ccameragainceiling = config_values[23].toInt();
+        }
+        if (config_value_count > 24 && is_config_integer(config_values[24])) {
+          ccamerawhitebalancemode = config_values[24].toInt();
+        }
+        if (config_value_count > 25 && is_config_integer(config_values[25])) {
+          ccamerahmirror = config_values[25].toInt();
+        }
+        if (config_value_count > 26 && is_config_integer(config_values[26])) {
+          ccameravflip = config_values[26].toInt();
+        }
+      }
+
       if (cwifimode < RECORDER_WIFI_OFF || cwifimode > RECORDER_WIFI_AP) {
         Serial.println("Invalid wifi mode; forcing WiFi off");
         cwifimode = RECORDER_WIFI_OFF;
@@ -806,6 +901,45 @@ void read_config_file() {
     Serial.println("Invalid STA IP mode; using DHCP/mDNS");
     cwifiipmode = 0;
   }
+  if (ccameraexposurevalue != CAMERA_SETTING_AUTO &&
+      (ccameraexposurevalue < MIN_CAMERA_EXPOSURE_VALUE ||
+       ccameraexposurevalue > MAX_CAMERA_EXPOSURE_VALUE)) {
+    Serial.printf("Invalid camera exposure value %d; using %d\n",
+                  ccameraexposurevalue, DEFAULT_CAMERA_EXPOSURE_VALUE);
+    ccameraexposurevalue = DEFAULT_CAMERA_EXPOSURE_VALUE;
+  }
+  if (ccameragainvalue != CAMERA_SETTING_AUTO &&
+      (ccameragainvalue < MIN_CAMERA_GAIN_VALUE ||
+       ccameragainvalue > MAX_CAMERA_GAIN_VALUE)) {
+    Serial.printf("Invalid camera gain value %d; using %d\n",
+                  ccameragainvalue, DEFAULT_CAMERA_GAIN_VALUE);
+    ccameragainvalue = DEFAULT_CAMERA_GAIN_VALUE;
+  }
+  cquality = validate_config_range("camera JPEG quality", cquality,
+                                   MIN_CAMERA_JPEG_QUALITY, MAX_CAMERA_JPEG_QUALITY,
+                                   DEFAULT_CAMERA_JPEG_QUALITY);
+  ccamerabrightness = validate_config_range("camera brightness", ccamerabrightness,
+                                             MIN_CAMERA_IMAGE_LEVEL, MAX_CAMERA_IMAGE_LEVEL,
+                                             DEFAULT_CAMERA_BRIGHTNESS);
+  ccameracontrast = validate_config_range("camera contrast", ccameracontrast,
+                                           MIN_CAMERA_IMAGE_LEVEL, MAX_CAMERA_IMAGE_LEVEL,
+                                           DEFAULT_CAMERA_CONTRAST);
+  ccamerasaturation = validate_config_range("camera saturation", ccamerasaturation,
+                                             MIN_CAMERA_IMAGE_LEVEL, MAX_CAMERA_IMAGE_LEVEL,
+                                             DEFAULT_CAMERA_SATURATION);
+  ccameraaelevel = validate_config_range("camera AE level", ccameraaelevel,
+                                         MIN_CAMERA_IMAGE_LEVEL, MAX_CAMERA_IMAGE_LEVEL,
+                                         DEFAULT_CAMERA_AE_LEVEL);
+  ccameragainceiling = validate_config_range("camera gain ceiling", ccameragainceiling,
+                                              MIN_CAMERA_GAIN_CEILING, MAX_CAMERA_GAIN_CEILING,
+                                              DEFAULT_CAMERA_GAIN_CEILING);
+  ccamerawhitebalancemode = validate_config_range("camera white-balance mode", ccamerawhitebalancemode,
+                                                   MIN_CAMERA_WHITE_BALANCE_MODE, MAX_CAMERA_WHITE_BALANCE_MODE,
+                                                   DEFAULT_CAMERA_WHITE_BALANCE_MODE);
+  ccamerahmirror = validate_config_range("camera horizontal mirror", ccamerahmirror,
+                                         0, 1, DEFAULT_CAMERA_HMIRROR);
+  ccameravflip = validate_config_range("camera vertical flip", ccameravflip,
+                                       0, 1, DEFAULT_CAMERA_VFLIP);
 
   Serial.printf("=========   Data fram config.txt and defaults  =========\n");
   Serial.printf("Name %s\n", cname); logfile.printf("Name %s\n", cname);
@@ -820,6 +954,21 @@ void read_config_file() {
   Serial.printf("Recording count %d (0 = unlimited)\n", crecordingcount); logfile.printf("Recording count %d (0 = unlimited)\n", crecordingcount);
   Serial.printf("Streamdelay %d\n", cstreamdelay); logfile.printf("Streamdelay %d\n", cstreamdelay);
   Serial.printf("WiFi mode %d (0=off, 1=sta, 2=ap)\n", cwifimode); logfile.printf("WiFi mode %d (0=off, 1=sta, 2=ap)\n", cwifimode);
+  if (ccameraexposurevalue == CAMERA_SETTING_AUTO) {
+    Serial.println("Camera exposure auto");
+  } else {
+    Serial.printf("Camera exposure manual value %d\n", ccameraexposurevalue);
+  }
+  if (ccameragainvalue == CAMERA_SETTING_AUTO) {
+    Serial.println("Camera gain auto");
+  } else {
+    Serial.printf("Camera gain manual value %d\n", ccameragainvalue);
+  }
+  Serial.printf("Camera image: JPEG quality %d, brightness %d, contrast %d, saturation %d\n",
+                cquality, ccamerabrightness, ccameracontrast, ccamerasaturation);
+  Serial.printf("Camera auto controls: AE level %d, gain ceiling %d; white balance %d; mirror %d; flip %d\n",
+                ccameraaelevel, ccameragainceiling, ccamerawhitebalancemode,
+                ccamerahmirror, ccameravflip);
   Serial.printf("Zone len %d, %s\n", czone.length(), czone.c_str()); //logfile.printf("Zone len %d, %s\n", czone.length(), czone);
   Serial.printf("ssid %s\n", cssid); logfile.printf("ssid %s\n", cssid);
 
@@ -842,6 +991,16 @@ void read_config_file() {
   speed_up_factor = cspeedup;
   stream_delay = cstreamdelay;
   max_recordings = crecordingcount;
+  camera_exposure_value = ccameraexposurevalue;
+  camera_gain_value = ccameragainvalue;
+  camera_brightness = ccamerabrightness;
+  camera_contrast = ccameracontrast;
+  camera_saturation = ccamerasaturation;
+  camera_ae_level = ccameraaelevel;
+  camera_gain_ceiling = ccameragainceiling;
+  camera_white_balance_mode = ccamerawhitebalancemode;
+  camera_hmirror = ccamerahmirror;
+  camera_vflip = ccameravflip;
   wifi_mode = cwifimode;
   wifi_ip_mode = cwifiipmode;
   cstaticip = cstaticipvalue;
@@ -3024,10 +3183,6 @@ void setup() {
   logfile.println(strdate);
 
   //digitalWrite(33, HIGH);         // red light turns off when setup is complete
-    //追記
-  sensor_t *sensor = esp_camera_sensor_get();
-  camera_setting(sensor);
-
   if (!InternetOff) {
     Serial.println("Starting Web Services ...");
     startCameraServer();
@@ -3493,20 +3648,82 @@ void the_camera_loop (void* pvParameter) {
 }
 
 
-void camera_setting(sensor_t *sensor){
-  sensor->set_exposure_ctrl(sensor, 0);
-  sensor->set_aec2(sensor, 0); 
-  sensor->set_aec_value(sensor, 70); //head2-40, head1-50 
-  //sensor->set_special_effect(sensor, 5); 
-  sensor->set_agc_gain(sensor, 5); 
-  //sensor->set_hmirror(sensor, 1); 
-  //sensor->set_vflip(sensor, 1); 
-  sensor->set_raw_gma(sensor, 0); 
-  sensor->set_whitebal(sensor, 0); 
-  sensor->set_awb_gain(sensor, 0); 
-  sensor->set_gain_ctrl(sensor, 0); 
-  //sensor->set_lenc(sensor, 0); 
-  //sensor->set_dcw(sensor, 1); 
-  //sensor->set_bpc(sensor, 0); 
-  //sensor->set_wpc(sensor, 1); 
+void camera_setting(sensor_t *sensor) {
+  if (sensor == NULL) {
+    Serial.println("Camera sensor settings unavailable");
+    if (logfile) logfile.println("Camera sensor settings unavailable");
+    return;
   }
+
+  int setting_errors = 0;
+
+  if (sensor->set_quality(sensor, quality) != 0) setting_errors++;
+  if (sensor->set_brightness(sensor, camera_brightness) != 0) setting_errors++;
+  if (sensor->set_contrast(sensor, camera_contrast) != 0) setting_errors++;
+  if (sensor->set_saturation(sensor, camera_saturation) != 0) setting_errors++;
+  if (sensor->set_hmirror(sensor, camera_hmirror) != 0) setting_errors++;
+  if (sensor->set_vflip(sensor, camera_vflip) != 0) setting_errors++;
+
+  Serial.printf("Applied camera image: JPEG quality %d, brightness %d, contrast %d, saturation %d\n",
+                quality, camera_brightness, camera_contrast, camera_saturation);
+  Serial.printf("Applied camera orientation: mirror %d, flip %d\n", camera_hmirror, camera_vflip);
+  if (logfile) {
+    logfile.printf("Applied camera image: JPEG quality %d, brightness %d, contrast %d, saturation %d\n",
+                   quality, camera_brightness, camera_contrast, camera_saturation);
+    logfile.printf("Applied camera orientation: mirror %d, flip %d\n", camera_hmirror, camera_vflip);
+  }
+
+  if (camera_white_balance_mode == CAMERA_WHITE_BALANCE_OFF) {
+    if (sensor->set_whitebal(sensor, 0) != 0) setting_errors++;
+    if (sensor->set_awb_gain(sensor, 0) != 0) setting_errors++;
+    Serial.println("Applied camera white balance: off");
+    if (logfile) logfile.println("Applied camera white balance: off");
+  } else {
+    if (sensor->set_whitebal(sensor, 1) != 0) setting_errors++;
+    if (sensor->set_awb_gain(sensor, 1) != 0) setting_errors++;
+    if (sensor->set_wb_mode(sensor, camera_white_balance_mode) != 0) setting_errors++;
+    Serial.printf("Applied camera white balance mode: %d\n", camera_white_balance_mode);
+    if (logfile) logfile.printf("Applied camera white balance mode: %d\n", camera_white_balance_mode);
+  }
+
+  // Keep the secondary AEC algorithm off, matching the previous firmware.
+  if (sensor->set_aec2(sensor, 0) != 0) setting_errors++;
+  if (sensor->set_ae_level(sensor, camera_ae_level) != 0) setting_errors++;
+  if (camera_exposure_value == CAMERA_SETTING_AUTO) {
+    if (sensor->set_exposure_ctrl(sensor, 1) != 0) setting_errors++;
+    Serial.println("Applied camera exposure: automatic");
+    if (logfile) logfile.println("Applied camera exposure: automatic");
+  } else {
+    if (sensor->set_exposure_ctrl(sensor, 0) != 0) setting_errors++;
+    if (sensor->set_aec_value(sensor, camera_exposure_value) != 0) setting_errors++;
+    Serial.printf("Applied camera exposure: manual value %d\n", camera_exposure_value);
+    if (logfile) logfile.printf("Applied camera exposure: manual value %d\n", camera_exposure_value);
+  }
+
+  if (sensor->set_gainceiling(sensor, (gainceiling_t)camera_gain_ceiling) != 0) setting_errors++;
+  if (camera_gain_value == CAMERA_SETTING_AUTO) {
+    if (sensor->set_gain_ctrl(sensor, 1) != 0) setting_errors++;
+    Serial.println("Applied camera gain: automatic");
+    if (logfile) logfile.println("Applied camera gain: automatic");
+  } else {
+    if (sensor->set_gain_ctrl(sensor, 0) != 0) setting_errors++;
+    if (sensor->set_agc_gain(sensor, camera_gain_value) != 0) setting_errors++;
+    Serial.printf("Applied camera gain: manual value %d\n", camera_gain_value);
+    if (logfile) logfile.printf("Applied camera gain: manual value %d\n", camera_gain_value);
+  }
+
+  Serial.printf("Applied camera auto controls: AE level %d, gain ceiling %d\n",
+                camera_ae_level, camera_gain_ceiling);
+  if (logfile) {
+    logfile.printf("Applied camera auto controls: AE level %d, gain ceiling %d\n",
+                   camera_ae_level, camera_gain_ceiling);
+  }
+
+  // Keep the remaining low-level image processing compatible with the prior firmware.
+  if (sensor->set_raw_gma(sensor, 0) != 0) setting_errors++;
+
+  if (setting_errors > 0) {
+    Serial.printf("WARNING: %d camera sensor setting calls failed\n", setting_errors);
+    if (logfile) logfile.printf("WARNING: %d camera sensor setting calls failed\n", setting_errors);
+  }
+}
