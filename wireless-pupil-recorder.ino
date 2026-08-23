@@ -157,7 +157,8 @@ const int MIN_CAMERA_WHITE_BALANCE_MODE = CAMERA_WHITE_BALANCE_OFF;
 const int MAX_CAMERA_WHITE_BALANCE_MODE = 4;
 const int DEFAULT_CAMERA_HMIRROR = 0;
 const int DEFAULT_CAMERA_VFLIP = 0;
-const int CURRENT_CONFIG_LINE_COUNT = 27;
+const int DEFAULT_CAMERA_RAW_GAMMA = 0;
+const int CURRENT_CONFIG_LINE_COUNT = 28;
 
 int framesize = DEFAULT_FRAME_SIZE_INDEX;
 int quality = DEFAULT_CAMERA_JPEG_QUALITY;
@@ -180,6 +181,7 @@ int camera_gain_ceiling = DEFAULT_CAMERA_GAIN_CEILING;
 int camera_white_balance_mode = DEFAULT_CAMERA_WHITE_BALANCE_MODE;
 int camera_hmirror = DEFAULT_CAMERA_HMIRROR;
 int camera_vflip = DEFAULT_CAMERA_VFLIP;
+int camera_raw_gamma = DEFAULT_CAMERA_RAW_GAMMA;
 uint32_t completed_recordings = 0;
 const uint32_t AVI_FLUSH_INTERVAL_MS = 1000;
 const uint32_t SD_TASK_STACK_SIZE = 8192;
@@ -726,6 +728,7 @@ void read_config_file() {
     -1  // white balance: -1=off, 0=auto, 1=sunny, 2=cloudy, 3=office, 4=home
     0  // horizontal mirror: 0=off, 1=on
     0  // vertical flip: 0=off, 1=on
+    0  // OV2640 raw gamma correction: 0=off, 1=on
     ~~~
 
     In STA/DHCP mode, browse to http://<camera-name>.local/.
@@ -766,6 +769,7 @@ void read_config_file() {
   int ccamerawhitebalancemode = DEFAULT_CAMERA_WHITE_BALANCE_MODE;
   int ccamerahmirror = DEFAULT_CAMERA_HMIRROR;
   int ccameravflip = DEFAULT_CAMERA_VFLIP;
+  int ccamerarawgamma = DEFAULT_CAMERA_RAW_GAMMA;
 
   File config_file =SD.open("/config.txt", "r");
   if (config_file) {
@@ -869,6 +873,9 @@ void read_config_file() {
         if (config_value_count > 26 && is_config_integer(config_values[26])) {
           ccameravflip = config_values[26].toInt();
         }
+        if (config_value_count > 27 && is_config_integer(config_values[27])) {
+          ccamerarawgamma = config_values[27].toInt();
+        }
       }
 
       if (cwifimode < RECORDER_WIFI_OFF || cwifimode > RECORDER_WIFI_AP) {
@@ -940,6 +947,8 @@ void read_config_file() {
                                          0, 1, DEFAULT_CAMERA_HMIRROR);
   ccameravflip = validate_config_range("camera vertical flip", ccameravflip,
                                        0, 1, DEFAULT_CAMERA_VFLIP);
+  ccamerarawgamma = validate_config_range("camera raw gamma", ccamerarawgamma,
+                                          0, 1, DEFAULT_CAMERA_RAW_GAMMA);
 
   Serial.printf("=========   Data fram config.txt and defaults  =========\n");
   Serial.printf("Name %s\n", cname); logfile.printf("Name %s\n", cname);
@@ -969,6 +978,8 @@ void read_config_file() {
   Serial.printf("Camera auto controls: AE level %d, gain ceiling %d; white balance %d; mirror %d; flip %d\n",
                 ccameraaelevel, ccameragainceiling, ccamerawhitebalancemode,
                 ccamerahmirror, ccameravflip);
+  Serial.printf("Camera raw gamma %d (0=off, 1=on)\n", ccamerarawgamma);
+  if (logfile) logfile.printf("Camera raw gamma %d (0=off, 1=on)\n", ccamerarawgamma);
   Serial.printf("Zone len %d, %s\n", czone.length(), czone.c_str()); //logfile.printf("Zone len %d, %s\n", czone.length(), czone);
   Serial.printf("ssid %s\n", cssid); logfile.printf("ssid %s\n", cssid);
 
@@ -1001,6 +1012,7 @@ void read_config_file() {
   camera_white_balance_mode = ccamerawhitebalancemode;
   camera_hmirror = ccamerahmirror;
   camera_vflip = ccameravflip;
+  camera_raw_gamma = ccamerarawgamma;
   wifi_mode = cwifimode;
   wifi_ip_mode = cwifiipmode;
   cstaticip = cstaticipvalue;
@@ -3719,8 +3731,9 @@ void camera_setting(sensor_t *sensor) {
                    camera_ae_level, camera_gain_ceiling);
   }
 
-  // Keep the remaining low-level image processing compatible with the prior firmware.
-  if (sensor->set_raw_gma(sensor, 0) != 0) setting_errors++;
+  if (sensor->set_raw_gma(sensor, camera_raw_gamma) != 0) setting_errors++;
+  Serial.printf("Applied camera raw gamma: %d\n", camera_raw_gamma);
+  if (logfile) logfile.printf("Applied camera raw gamma: %d\n", camera_raw_gamma);
 
   if (setting_errors > 0) {
     Serial.printf("WARNING: %d camera sensor setting calls failed\n", setting_errors);
