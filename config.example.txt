@@ -1,11 +1,11 @@
-desklens  // camera name and mDNS host: http://desklens.local/
-11  // stable recorder frame-size index: 11=HD (1280x720)
-1800  // recording length in seconds
-0  // recording count; 0=unlimited
-0  // recording frame interval in ms; 0=fastest
+pupilcamera  // camera name and mDNS host: http://pupilcamera.local/
+8  // stable recorder frame-size index: 8=VGA (640x480)
+200  // recording length in seconds
+1  // recording count; 0=unlimited
+50  // recording frame interval in ms; 0=fastest
 1  // playback speed multiplier; 1=real time
 0  // live stream frame interval in ms; 0=fastest
-GMT  // timezone
+JST-9  // timezone
 0  // wifi mode: 0=off, 1=sta, 2=ap
 YOUR_WIFI_SSID  // STA network SSID, or ESP32 AP name in AP mode
 YOUR_WIFI_PASSWORD  // STA password, or ESP32 AP password (8-63 chars) in AP mode
