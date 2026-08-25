@@ -3117,7 +3117,7 @@ void setup() {
   if (!timestampFile) {
     Serial.println("Failed to open timestamp file");
   } else {
-    timestampFile.println("frame_number,timestamp_ms");
+    timestampFile.println("frame_number,timestamp_s");
     //timestampFile.close();
   }
 //追加
