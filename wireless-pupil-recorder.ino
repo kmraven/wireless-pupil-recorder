@@ -2166,6 +2166,43 @@ static esp_err_t capture_handler(httpd_req_t *req) {
   return res;
 }
 
+static esp_err_t live_handler(httpd_req_t *req) {
+  static const char live_page[] PROGMEM = R"rawliteral(<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Live stream</title>
+<style>
+body { margin: 0; padding: 1rem; font-family: sans-serif; background: #111; color: #eee; }
+main { max-width: 960px; margin: 0 auto; }
+img { display: block; width: 100%; height: auto; background: #000; }
+a { color: #8cf; }
+</style>
+</head>
+<body>
+<main>
+<h1>Live stream</h1>
+<p>Only one live-stream page can be connected at a time.</p>
+<img id="live-stream" alt="Connecting to the camera stream ...">
+<p><a href="/">Back to recorder status</a></p>
+</main>
+<script>
+document.getElementById('live-stream').src =
+  window.location.protocol + '//' + window.location.hostname + ':81/stream';
+</script>
+</body>
+</html>)rawliteral";
+
+  esp_err_t result = httpd_resp_set_type(req, "text/html; charset=utf-8");
+  if (result == ESP_OK) {
+    result = httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
+  }
+  if (result == ESP_OK) result = httpd_resp_set_hdr(req, "Pragma", "no-cache");
+  if (result != ESP_OK) return result;
+  return httpd_resp_send(req, live_page, strlen(live_page));
+}
+
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 //
@@ -2206,7 +2243,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
 
  <h3><a href="http://%s/">http://%s/</a></h3>
  <h3>Streaming</h3>
- <a href="http://%s:81/stream"><button>Live stream</button></a>
+ <a href="http://%s/live"><button>Live stream</button></a>
  <h3>Series of pictures</h3>
  <a href="http://%s/photos"><button>10 x 3 sec</button> </a>
  <a href="http://%s/fphotos"><button>10 x 1 sec</button></a>
@@ -2725,6 +2762,9 @@ static esp_err_t stream_81_handler(httpd_req_t *req) {
   result = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
   if (result == ESP_OK) result = httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
   if (result == ESP_OK) result = httpd_resp_set_hdr(req, "Pragma", "no-cache");
+  if (result == ESP_OK) {
+    result = send_stream_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY), "initial boundary");
+  }
 
   while (result == ESP_OK && stream_81 && !safe_stop_requested) {
     size_t jpg_length = 0;
@@ -2743,10 +2783,14 @@ static esp_err_t stream_81_handler(httpd_req_t *req) {
     size_t part_length = snprintf(part_buffer, sizeof(part_buffer), _STREAM_PART, jpg_length);
     uint32_t send_started_at = millis();
 
-    result = send_stream_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY), "boundary");
-    if (result == ESP_OK) result = send_stream_chunk(req, part_buffer, part_length, "header");
+    result = send_stream_chunk(req, part_buffer, part_length, "header");
     if (result == ESP_OK) {
       result = send_stream_chunk(req, (const char *)framebuffer2, jpg_length, "JPEG");
+    }
+    if (result == ESP_OK) {
+      // Delimit the completed JPEG immediately. Some browsers otherwise wait
+      // for the next low-rate frame before repainting the current one.
+      result = send_stream_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY), "boundary");
     }
 
     if (result != ESP_OK) break;
@@ -2815,7 +2859,7 @@ void startCameraServer() {
   if (camera_httpd != NULL) return;
 
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.max_uri_handlers = 8;
+  config.max_uri_handlers = 9;
   config.stack_size = 4096 + 1024;
 
   Serial.print("http task prio: "); Serial.println(config.task_priority);
@@ -2830,6 +2874,12 @@ void startCameraServer() {
     .uri       = "/capture",
     .method    = HTTP_GET,
     .handler   = capture_handler,
+    .user_ctx  = NULL
+  };
+  httpd_uri_t live_uri = {
+    .uri       = "/live",
+    .method    = HTTP_GET,
+    .handler   = live_handler,
     .user_ctx  = NULL
   };
   //  httpd_uri_t stream_uri = {
@@ -2883,6 +2933,7 @@ void startCameraServer() {
 
   if (httpd_start(&camera_httpd, &config) == ESP_OK) {
     httpd_register_uri_handler(camera_httpd, &index_uri);
+    httpd_register_uri_handler(camera_httpd, &live_uri);
     httpd_register_uri_handler(camera_httpd, &capture_uri);
     //    httpd_register_uri_handler(camera_httpd, &stream_uri);
     httpd_register_uri_handler(camera_httpd, &photos_uri);
