@@ -186,6 +186,8 @@ uint32_t completed_recordings = 0;
 const uint32_t AVI_FLUSH_INTERVAL_MS = 1000;
 const uint32_t SD_TASK_STACK_SIZE = 8192;
 const uint32_t SD_STACK_LOG_INTERVAL_WRITES = 100;
+const uint32_t CAMERA_AUTO_TELEMETRY_INTERVAL_MS = 1000;
+const uint32_t CAMERA_AUTO_TELEMETRY_FLUSH_SAMPLES = 10;
 uint32_t last_avi_flush_time = 0;
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -307,6 +309,9 @@ int  gmdelay;
 //  Avi Writer Stuff here
 
 void camera_setting(sensor_t *sensor); //変更
+void setup_camera_auto_telemetry();
+void reset_camera_auto_telemetry_for_recording();
+void log_camera_auto_telemetry(uint32_t frame_number, float elapsed_sec);
 int64_t avi_start_time_exact; //変更
 // MicroSD
 #include "driver/sdmmc_host.h"
@@ -322,6 +327,13 @@ File avifile;
 File idxfile;
 File timestampFile;
 File illuminanceFile;
+File cameraAutoFile;
+
+bool camera_auto_telemetry_enabled = false;
+bool camera_auto_telemetry_has_sample = false;
+bool camera_auto_telemetry_read_error_reported = false;
+uint32_t camera_auto_telemetry_last_sample_ms = 0;
+uint32_t camera_auto_telemetry_sample_count = 0;
 
 char avi_file_name[100];
 
@@ -3028,6 +3040,7 @@ void perform_safe_sd_shutdown() {
   close_file_for_safe_shutdown(idxfile);
   close_file_for_safe_shutdown(timestampFile);
   close_file_for_safe_shutdown(illuminanceFile);
+  close_file_for_safe_shutdown(cameraAutoFile);
   close_file_for_safe_shutdown(logfile);
   SD.end();
 
@@ -3200,6 +3213,7 @@ void setup() {
   }
   Serial.println("Setting up the camera ...");
   config_camera();
+  setup_camera_auto_telemetry();
 
   Serial.println("Checking SD for available space ...");
   delete_old_stuff();
@@ -3504,6 +3518,7 @@ void the_camera_loop (void* pvParameter) {
       avi_start_time = millis();
       //追加
       avi_start_time_exact = esp_timer_get_time();
+      reset_camera_auto_telemetry_for_recording();
       Serial.printf("\nStart the avi ... at %d\n", avi_start_time);
       Serial.printf("Framesize %d, quality %d, length %d seconds\n\n", framesize, quality, avi_length);
       logfile.printf("\nStart the avi ... at %d\n", avi_start_time);
@@ -3651,14 +3666,15 @@ void the_camera_loop (void* pvParameter) {
         }
       }
       //追加
+      float elapsed_sec = (float)(esp_timer_get_time() - avi_start_time_exact) * 0.000001;
       if ( timestampFile ) {
         //timestampFile.printf("%d,%llu\n", frame_cnt, 0.001 * (millis() - avi_start_time));
-        float elapsed_sec = (float)(esp_timer_get_time() - avi_start_time_exact) * 0.000001;
         timestampFile.printf("%d,%.6f\n", frame_cnt, elapsed_sec);
         if (frame_cnt % 100 == 10 ){
           timestampFile.flush();
         }
       }
+      log_camera_auto_telemetry(frame_cnt, elapsed_sec);
       //
       if ( illuminanceFile ) {
         //int total = 0;
@@ -3707,6 +3723,191 @@ void the_camera_loop (void* pvParameter) {
         }
       }
     }
+  }
+}
+
+
+static const uint8_t OV2640_AGC_GAIN_TABLE[31] = {
+  0x00, 0x10, 0x18, 0x30, 0x34, 0x38, 0x3C, 0x70,
+  0x72, 0x74, 0x76, 0x78, 0x7A, 0x7C, 0x7E, 0xF0,
+  0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
+  0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF
+};
+
+static int ov2640_sensor_register(uint8_t address) {
+  return 0x0100 | address;
+}
+
+static int ov2640_dsp_register(uint8_t address) {
+  return address;
+}
+
+static float ov2640_gain_multiplier(uint8_t gain_register) {
+  float multiplier = 1.0f + (float)(gain_register & 0x0F) / 16.0f;
+  uint8_t doubling_stages = gain_register >> 4;
+  for (uint8_t bit = 0; bit < 4; ++bit) {
+    if (doubling_stages & (1U << bit)) {
+      multiplier *= 2.0f;
+    }
+  }
+  return multiplier;
+}
+
+static int ov2640_gain_setting_equivalent(uint8_t gain_register) {
+  for (int setting = 0; setting < 30; ++setting) {
+    if (gain_register >= OV2640_AGC_GAIN_TABLE[setting] &&
+        gain_register < OV2640_AGC_GAIN_TABLE[setting + 1]) {
+      return setting;
+    }
+  }
+  return 30;
+}
+
+void setup_camera_auto_telemetry() {
+  camera_auto_telemetry_enabled = false;
+
+  bool exposure_is_auto = camera_exposure_value == CAMERA_SETTING_AUTO;
+  bool gain_is_auto = camera_gain_value == CAMERA_SETTING_AUTO;
+  if (!exposure_is_auto && !gain_is_auto) {
+    return;
+  }
+
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (sensor == NULL || sensor->id.PID != OV2640_PID || sensor->get_reg == NULL) {
+    Serial.println("Automatic camera telemetry is available only for OV2640; CSV logging disabled");
+    if (logfile) logfile.println("Automatic camera telemetry is available only for OV2640; CSV logging disabled");
+    return;
+  }
+
+  char camera_auto_name[100];
+  snprintf(camera_auto_name, sizeof(camera_auto_name),
+           "/%s%04d.%03d.camera.csv", devname, file_group, file_number);
+  Serial.printf("Creating cameraAutoFile %s\n", camera_auto_name);
+  cameraAutoFile = SD.open(camera_auto_name, FILE_WRITE);
+  if (!cameraAutoFile) {
+    Serial.println("Failed to open automatic camera telemetry file");
+    if (logfile) logfile.println("Failed to open automatic camera telemetry file");
+    return;
+  }
+
+  cameraAutoFile.println(
+    "frame_number,timestamp_s,auto_exposure_value,auto_gain_register,"
+    "auto_gain_multiplier,auto_gain_setting_equivalent,raw_gamma,read_ok");
+  cameraAutoFile.flush();
+  camera_auto_telemetry_enabled = true;
+
+  Serial.printf("Automatic camera telemetry enabled every %lu ms (exposure=%s, gain=%s)\n",
+                (unsigned long)CAMERA_AUTO_TELEMETRY_INTERVAL_MS,
+                exposure_is_auto ? "auto" : "manual",
+                gain_is_auto ? "auto" : "manual");
+  if (logfile) {
+    logfile.printf("Automatic camera telemetry enabled every %lu ms (exposure=%s, gain=%s)\n",
+                   (unsigned long)CAMERA_AUTO_TELEMETRY_INTERVAL_MS,
+                   exposure_is_auto ? "auto" : "manual",
+                   gain_is_auto ? "auto" : "manual");
+  }
+}
+
+void reset_camera_auto_telemetry_for_recording() {
+  camera_auto_telemetry_has_sample = false;
+  camera_auto_telemetry_read_error_reported = false;
+}
+
+void log_camera_auto_telemetry(uint32_t frame_number, float elapsed_sec) {
+  if (!camera_auto_telemetry_enabled || !cameraAutoFile) {
+    return;
+  }
+
+  uint32_t now_ms = millis();
+  if (camera_auto_telemetry_has_sample &&
+      (uint32_t)(now_ms - camera_auto_telemetry_last_sample_ms) < CAMERA_AUTO_TELEMETRY_INTERVAL_MS) {
+    return;
+  }
+  camera_auto_telemetry_has_sample = true;
+  camera_auto_telemetry_last_sample_ms = now_ms;
+
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (sensor == NULL || sensor->id.PID != OV2640_PID || sensor->get_reg == NULL) {
+    if (!camera_auto_telemetry_read_error_reported) {
+      Serial.println("Automatic camera telemetry sensor access failed");
+      if (logfile) logfile.println("Automatic camera telemetry sensor access failed");
+      camera_auto_telemetry_read_error_reported = true;
+    }
+    return;
+  }
+
+  char exposure_field[12] = "";
+  char gain_register_field[12] = "";
+  char gain_multiplier_field[16] = "";
+  char gain_setting_field[12] = "";
+  char raw_gamma_field[4] = "";
+  bool read_ok = true;
+
+  if (camera_exposure_value == CAMERA_SETTING_AUTO) {
+    int reg45 = sensor->get_reg(sensor, ov2640_sensor_register(0x45), 0x3F);
+    int aec = sensor->get_reg(sensor, ov2640_sensor_register(0x10), 0xFF);
+    int reg04 = sensor->get_reg(sensor, ov2640_sensor_register(0x04), 0x03);
+    if (reg45 < 0 || aec < 0 || reg04 < 0) {
+      read_ok = false;
+    } else {
+      uint16_t exposure_value =
+        ((uint16_t)(reg45 & 0x3F) << 10) |
+        ((uint16_t)(aec & 0xFF) << 2) |
+        (uint16_t)(reg04 & 0x03);
+      snprintf(exposure_field, sizeof(exposure_field), "%u", (unsigned int)exposure_value);
+    }
+  }
+
+  if (camera_gain_value == CAMERA_SETTING_AUTO) {
+    int gain_register = sensor->get_reg(sensor, ov2640_sensor_register(0x00), 0xFF);
+    if (gain_register < 0) {
+      read_ok = false;
+    } else {
+      uint8_t gain = (uint8_t)gain_register;
+      snprintf(gain_register_field, sizeof(gain_register_field), "%u", (unsigned int)gain);
+      snprintf(gain_multiplier_field, sizeof(gain_multiplier_field), "%.3f",
+               ov2640_gain_multiplier(gain));
+      snprintf(gain_setting_field, sizeof(gain_setting_field), "%d",
+               ov2640_gain_setting_equivalent(gain));
+    }
+  }
+
+  int raw_gamma = sensor->get_reg(sensor, ov2640_dsp_register(0xC3), 0x20);
+  if (raw_gamma < 0) {
+    read_ok = false;
+  } else {
+    snprintf(raw_gamma_field, sizeof(raw_gamma_field), "%d", (raw_gamma & 0x20) ? 1 : 0);
+  }
+
+  char row[160];
+  int row_length = snprintf(
+    row,
+    sizeof(row),
+    "%lu,%.6f,%s,%s,%s,%s,%s,%d\n",
+    (unsigned long)frame_number,
+    elapsed_sec,
+    exposure_field,
+    gain_register_field,
+    gain_multiplier_field,
+    gain_setting_field,
+    raw_gamma_field,
+    read_ok ? 1 : 0
+  );
+  if (row_length > 0) {
+    cameraAutoFile.write((const uint8_t *)row, (size_t)row_length);
+  }
+
+  camera_auto_telemetry_sample_count++;
+  if (camera_auto_telemetry_sample_count % CAMERA_AUTO_TELEMETRY_FLUSH_SAMPLES == 0) {
+    cameraAutoFile.flush();
+  }
+
+  if (!read_ok && !camera_auto_telemetry_read_error_reported) {
+    Serial.println("Automatic camera telemetry register read failed; blank CSV fields indicate missing values");
+    if (logfile) {
+      logfile.println("Automatic camera telemetry register read failed; blank CSV fields indicate missing values");
+    }
+    camera_auto_telemetry_read_error_reported = true;
   }
 }
 
