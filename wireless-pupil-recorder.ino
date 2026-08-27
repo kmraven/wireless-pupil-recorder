@@ -610,6 +610,7 @@ static void config_camera() {
 #define SD_SPI_SCK   7
 #define SD_SPI_CS    21
 const uint32_t SD_SPI_FREQUENCY = 10000000;
+const uint8_t SD_MAX_OPEN_FILES = 10;
 
 static esp_err_t init_sdcard()
 {
@@ -619,7 +620,7 @@ static esp_err_t init_sdcard()
   
   // 2. SD.hライブラリを使用してSDカードを初期化
   // SD.begin()の呼び出しは、SPIバスが設定された後に行う
-  if (!SD.begin(SD_SPI_CS, SPI, SD_SPI_FREQUENCY)) {
+  if (!SD.begin(SD_SPI_CS, SPI, SD_SPI_FREQUENCY, "/sd", SD_MAX_OPEN_FILES)) {
     Serial.println("SD card initialization failed! (SPI Mode)");
     // 元のコードのメッセージとMajor Failを発動
     // 付近の Major Fail につながる
@@ -630,7 +631,9 @@ static esp_err_t init_sdcard()
   
   // 3. 成功時の処理 (元のロジックをSD.hに置き換え)
   // 付近のロジックに相当
-  Serial.printf("SD.begin success at %lu Hz\n", (unsigned long)SD_SPI_FREQUENCY); // 成功ログを追加
+  Serial.printf("SD.begin success at %lu Hz (max open files: %u)\n",
+                (unsigned long)SD_SPI_FREQUENCY,
+                (unsigned int)SD_MAX_OPEN_FILES); // 成功ログを追加
   uint8_t cardType = SD.cardType();
 
   // ... (カードタイプ表示のロジックはSDからSDに置き換える) ...
