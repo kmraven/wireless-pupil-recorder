@@ -336,6 +336,12 @@ uint32_t camera_auto_telemetry_last_sample_ms = 0;
 uint32_t camera_auto_telemetry_sample_count = 0;
 
 char avi_file_name[100];
+char timestamp_file_name[100] = "";
+char illuminance_file_name[100] = "";
+char camera_auto_file_name[100] = "";
+bool timestamp_file_created = false;
+bool illuminance_file_created = false;
+bool camera_auto_file_created = false;
 
 static int i = 0;
 uint32_t frame_cnt = 0;
@@ -1395,6 +1401,94 @@ void do_eprom_write() {
 // start_avi - open the files and write in headers
 //
 
+static void close_recording_csv_files() {
+  if (timestampFile) {
+    timestampFile.flush();
+    timestampFile.close();
+  }
+  if (illuminanceFile) {
+    illuminanceFile.flush();
+    illuminanceFile.close();
+  }
+  if (cameraAutoFile) {
+    cameraAutoFile.flush();
+    cameraAutoFile.close();
+  }
+}
+
+static void clear_recording_csv_file_state() {
+  timestamp_file_name[0] = '\0';
+  illuminance_file_name[0] = '\0';
+  camera_auto_file_name[0] = '\0';
+  timestamp_file_created = false;
+  illuminance_file_created = false;
+  camera_auto_file_created = false;
+}
+
+static void remove_recording_csv_file(const char *path, bool was_created) {
+  if (!was_created || path == NULL || path[0] == '\0') {
+    return;
+  }
+  if (!SD.remove(path)) {
+    Serial.printf("Failed to remove discarded recording CSV %s\n", path);
+    if (logfile) logfile.printf("Failed to remove discarded recording CSV %s\n", path);
+  }
+}
+
+static void remove_recording_csv_files() {
+  remove_recording_csv_file(timestamp_file_name, timestamp_file_created);
+  remove_recording_csv_file(illuminance_file_name, illuminance_file_created);
+  remove_recording_csv_file(camera_auto_file_name, camera_auto_file_created);
+}
+
+static void open_recording_csv_files(int recording_file_number) {
+  close_recording_csv_files();
+  clear_recording_csv_file_state();
+
+  snprintf(timestamp_file_name, sizeof(timestamp_file_name),
+           "/%s%04d.%03d.time.csv", devname, file_group, recording_file_number);
+  Serial.printf("Creating timestampFile %s\n", timestamp_file_name);
+  timestampFile = SD.open(timestamp_file_name, "w");
+  if (!timestampFile) {
+    Serial.println("Failed to open timestamp file");
+    if (logfile) logfile.println("Failed to open timestamp file");
+  } else {
+    timestamp_file_created = true;
+    timestampFile.println("frame_number,timestamp_s");
+    timestampFile.flush();
+  }
+
+  snprintf(illuminance_file_name, sizeof(illuminance_file_name),
+           "/%s%04d.%03d.illuminance.csv", devname, file_group, recording_file_number);
+  Serial.printf("Creating illuminanceFile %s\n", illuminance_file_name);
+  illuminanceFile = SD.open(illuminance_file_name, "w");
+  if (!illuminanceFile) {
+    Serial.println("Failed to open illuminance file");
+    if (logfile) logfile.println("Failed to open illuminance file");
+  } else {
+    illuminance_file_created = true;
+    illuminanceFile.println("frame_number,illuminance");
+    illuminanceFile.flush();
+  }
+
+  if (camera_auto_telemetry_enabled) {
+    snprintf(camera_auto_file_name, sizeof(camera_auto_file_name),
+             "/%s%04d.%03d.camera.csv", devname, file_group, recording_file_number);
+    Serial.printf("Creating cameraAutoFile %s\n", camera_auto_file_name);
+    cameraAutoFile = SD.open(camera_auto_file_name, "w");
+    if (!cameraAutoFile) {
+      Serial.println("Failed to open automatic camera telemetry file");
+      if (logfile) logfile.println("Failed to open automatic camera telemetry file");
+    } else {
+      camera_auto_file_created = true;
+      cameraAutoFile.println(
+        "frame_number,timestamp_s,auto_exposure_value,auto_gain_register,"
+        "auto_gain_multiplier,auto_gain_setting_equivalent,raw_gamma,read_ok");
+      cameraAutoFile.flush();
+    }
+  }
+}
+
 static void start_avi(const camera_fb_t *first_frame) {
 
   long start = millis();
@@ -1410,7 +1504,8 @@ static void start_avi(const camera_fb_t *first_frame) {
 
   Serial.println("Starting an avi ");
 
-  sprintf(avi_file_name, "/%s%d.%03d.avi",  devname, file_group, file_number);
+  int recording_file_number = file_number;
+  sprintf(avi_file_name, "/%s%d.%03d.avi",  devname, file_group, recording_file_number);
 
   file_number++;
 
@@ -1431,6 +1526,8 @@ static void start_avi(const camera_fb_t *first_frame) {
     Serial.println("Could not open file /idx.tmp");
     major_fail();
   }
+
+  open_recording_csv_files(recording_file_number);
 
   for ( i = 0; i < AVIOFFSET; i++) {
     char ch = pgm_read_byte(&avi_header[i]);
@@ -1630,6 +1727,7 @@ static void end_avi() {
 
   Serial.println("End of avi - closing the files");
   logfile.println("End of avi - closing the files");
+  close_recording_csv_files();
 
   if (frame_cnt <  5 ) {
     Serial.println("Recording screwed up, less than 5 frames, forget index\n");
@@ -1639,6 +1737,7 @@ static void end_avi() {
     avifile.close();
     int xx = remove("/idx.tmp");
     int yy = remove(avi_file_name);
+    remove_recording_csv_files();
 
   } else {
 
@@ -1743,6 +1842,8 @@ static void end_avi() {
 
     int xx =SD.remove("/idx.tmp");
   }
+
+  clear_recording_csv_file_state();
 
   Serial.println("---");  logfile.println("---");
 
@@ -2193,18 +2294,55 @@ body { margin: 0; padding: 1rem; font-family: sans-serif; background: #111; colo
 main { max-width: 960px; margin: 0 auto; }
 img { display: block; width: 100%; height: auto; background: #000; }
 a { color: #8cf; }
+#stream-status { color: #fc8; }
 </style>
 </head>
 <body>
 <main>
 <h1>Live stream</h1>
 <p>Only one live-stream page can be connected at a time.</p>
+<p id="stream-status">Connecting ...</p>
 <img id="live-stream" alt="Connecting to the camera stream ...">
 <p><a href="/">Back to recorder status</a></p>
 </main>
 <script>
-document.getElementById('live-stream').src =
-  window.location.protocol + '//' + window.location.hostname + ':81/stream';
+const streamImage = document.getElementById('live-stream');
+const streamStatus = document.getElementById('stream-status');
+const streamUrl = window.location.protocol + '//' + window.location.hostname + ':81/stream';
+let reconnectTimer = 0;
+
+function connectStream() {
+  reconnectTimer = 0;
+  streamStatus.textContent = 'Connecting ...';
+  streamImage.src = streamUrl + '?retry=' + Date.now();
+}
+
+function scheduleReconnect(delayMs) {
+  if (reconnectTimer !== 0) return;
+  streamStatus.textContent = 'Stream disconnected. Reconnecting ...';
+  streamImage.removeAttribute('src');
+  reconnectTimer = window.setTimeout(connectStream, delayMs);
+}
+
+streamImage.addEventListener('load', function() {
+  streamStatus.textContent = 'Streaming';
+});
+streamImage.addEventListener('error', function() {
+  scheduleReconnect(2000);
+});
+window.addEventListener('online', function() {
+  scheduleReconnect(100);
+});
+document.addEventListener('visibilitychange', function() {
+  if (!document.hidden) {
+    if (reconnectTimer !== 0) window.clearTimeout(reconnectTimer);
+    reconnectTimer = 0;
+    streamImage.removeAttribute('src');
+    reconnectTimer = window.setTimeout(connectStream, 100);
+  }
+});
+
+connectStream();
 </script>
 </body>
 </html>)rawliteral";
@@ -3063,13 +3201,6 @@ void park_camera_for_safe_shutdown() {
   vTaskDelete(NULL);
 }
 
-bool wifi_switch_requests_on() {
-  int first_sample = digitalRead(44);
-  delay(20);
-  int second_sample = digitalRead(44);
-  return first_sample == HIGH && second_sample == HIGH;
-}
-
 void setup() {
 
   Serial.begin(115200);
@@ -3091,7 +3222,6 @@ void setup() {
   pinMode(SAFE_STOP_BUTTON_PIN, INPUT_PULLUP);
 
   pinMode(43, INPUT_PULLUP); // pull this down to stop recording をGPIO43に変更
-  pinMode(44, INPUT_PULLUP);        // pull this down switch wifi をGPIO44に変更
 
   //Serial.setDebugOutput(true);
 
@@ -3149,8 +3279,7 @@ void setup() {
 
   read_config_file();
 
-  bool wifi_requested_at_startup =
-    wifi_mode != RECORDER_WIFI_OFF && wifi_switch_requests_on();
+  bool wifi_requested_at_startup = wifi_mode != RECORDER_WIFI_OFF;
 
   if (reason == ESP_RST_BROWNOUT && wifi_mode != RECORDER_WIFI_OFF) {
     wifi_suppressed_after_brownout = true;
@@ -3173,31 +3302,6 @@ void setup() {
   sprintf(logname, "/%s%04d.999.txt",  devname, file_group);
   Serial.printf("Creating logfile %s\n",  logname);
   logfile = SD.open(logname, FILE_WRITE);
-
-  //追加
-  //char timestampname[50];
-  char timestampname[100];
-  //sprintf(timestampname, "/%s%d.time.csv",  devname, file_group);
-  sprintf(timestampname, "/%s%04d.%03d.time.csv",  devname, file_group, file_number);
-  Serial.printf("Creating timestampFile %s\n",  timestampname);
-  timestampFile = SD.open(timestampname, FILE_WRITE);
-  if (!timestampFile) {
-    Serial.println("Failed to open timestamp file");
-  } else {
-    timestampFile.println("frame_number,timestamp_s");
-    //timestampFile.close();
-  }
-//追加
-  char illuminancename[100];
-  sprintf(illuminancename, "/%s%04d.%03d.illuminance.csv",  devname, file_group, file_number);
-  Serial.printf("Creating illuminanceFile %s\n",  illuminancename);
-  illuminanceFile = SD.open(illuminancename, FILE_WRITE);
-  if (!illuminanceFile) {
-    Serial.println("Failed to open illuminance file");
-  } else {
-    illuminanceFile.println("frame_number,illuminance");
-  }
-
 
   if (!logfile) {
     Serial.println("Failed to open logfile for writing");
@@ -3368,27 +3472,11 @@ void loop() {
     else start_record = 0;
   }
 
-  int read13 = digitalRead(44); // Pin 13を44に変更 
-  delay(20);
-  read13 = read13 + digitalRead(44); // Pin 13を44に変更 // get 2 opinions to help poor soldering
-
-  if (wifi_mode != RECORDER_WIFI_OFF && !wifi_suppressed_after_brownout) {
-    if (read13 > 0) {
-      read13 = 0;
-    } else {
-      read13 = 2;
-    }
-  }
-
-  if (wifi_mode != RECORDER_WIFI_OFF && !wifi_suppressed_after_brownout) {
-    if (read13 == 2 && !InternetOff) {
-      Serial.println("Shutting off wifi ..."); logfile.println("Shutting off wifi ...");
-      filemgr.end();
-      stopCameraServer();
-      stop_wifi_completely();
-    }
+  if (wifi_mode != RECORDER_WIFI_OFF &&
+      !wifi_suppressed_after_brownout &&
+      InternetOff) {
     static uint32_t next_wifi_retry = 0;
-    if (read13 == 0 && InternetOff && (int32_t)(millis() - next_wifi_retry) >= 0) {
+    if ((int32_t)(millis() - next_wifi_retry) >= 0) {
       next_wifi_retry = millis() + 30000;
       Serial.println("Starting the wifi ...");  logfile.println("Starting the wifi ...");
       if (init_wifi()) {
@@ -3782,29 +3870,14 @@ void setup_camera_auto_telemetry() {
     return;
   }
 
-  char camera_auto_name[100];
-  snprintf(camera_auto_name, sizeof(camera_auto_name),
-           "/%s%04d.%03d.camera.csv", devname, file_group, file_number);
-  Serial.printf("Creating cameraAutoFile %s\n", camera_auto_name);
-  cameraAutoFile = SD.open(camera_auto_name, FILE_WRITE);
-  if (!cameraAutoFile) {
-    Serial.println("Failed to open automatic camera telemetry file");
-    if (logfile) logfile.println("Failed to open automatic camera telemetry file");
-    return;
-  }
-
-  cameraAutoFile.println(
-    "frame_number,timestamp_s,auto_exposure_value,auto_gain_register,"
-    "auto_gain_multiplier,auto_gain_setting_equivalent,raw_gamma,read_ok");
-  cameraAutoFile.flush();
   camera_auto_telemetry_enabled = true;
 
-  Serial.printf("Automatic camera telemetry enabled every %lu ms (exposure=%s, gain=%s)\n",
+  Serial.printf("Automatic camera telemetry ready every %lu ms (exposure=%s, gain=%s)\n",
                 (unsigned long)CAMERA_AUTO_TELEMETRY_INTERVAL_MS,
                 exposure_is_auto ? "auto" : "manual",
                 gain_is_auto ? "auto" : "manual");
   if (logfile) {
-    logfile.printf("Automatic camera telemetry enabled every %lu ms (exposure=%s, gain=%s)\n",
+    logfile.printf("Automatic camera telemetry ready every %lu ms (exposure=%s, gain=%s)\n",
                    (unsigned long)CAMERA_AUTO_TELEMETRY_INTERVAL_MS,
                    exposure_is_auto ? "auto" : "manual",
                    gain_is_auto ? "auto" : "manual");
@@ -3814,6 +3887,7 @@ void setup_camera_auto_telemetry() {
 void reset_camera_auto_telemetry_for_recording() {
   camera_auto_telemetry_has_sample = false;
   camera_auto_telemetry_read_error_reported = false;
+  camera_auto_telemetry_sample_count = 0;
 }
 
 void log_camera_auto_telemetry(uint32_t frame_number, float elapsed_sec) {
